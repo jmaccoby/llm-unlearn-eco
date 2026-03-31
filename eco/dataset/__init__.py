@@ -19,6 +19,7 @@ from .mmlu_subset import (
 )
 from .openbookqa import OpenBookQA
 from .piqa import PIQA
+from .rtofu import RTOFU
 from .social_i_qa import SocialIQA
 from .tofu import TOFU, TOFUPerturbed
 from .truthfulqa import TruthfulQA
@@ -36,6 +37,7 @@ dataset_classes = {
         OpenBookQA,
         TOFU,
         TOFUPerturbed,
+        RTOFU,
         TruthfulQA,
         Winogrande,
         PIQA,
