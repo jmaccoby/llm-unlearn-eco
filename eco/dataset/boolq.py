@@ -21,7 +21,7 @@ class BoolQ(BaseDataset):
 
     def download(self):
         self.dataset = load_dataset(
-            self.path, keep_in_memory=True, trust_remote_code=True
+            self.path, keep_in_memory=True
         )
 
     def load_dataset_for_eval(

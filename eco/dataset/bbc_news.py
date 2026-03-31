@@ -61,7 +61,7 @@ class BBCNews(BaseDataset):
     def download(self):
         datasets = [
             load_dataset(
-                "RealTimeData/bbc_news_alltime", month, trust_remote_code=True
+                "RealTimeData/bbc_news_alltime", month
             )["train"]
             for month in self.months
         ]
@@ -73,7 +73,7 @@ class BBCNews(BaseDataset):
             forget_titles.extend(title)
             forget_contents.extend(dataset["content"])
 
-        dataset = load_dataset("cc_news", trust_remote_code=True)["train"]
+        dataset = load_dataset("cc_news")["train"]
         retain_titles, retain_contents = [], []
         test_titles, test_contents = [], []
         rng = np.random.default_rng(42)

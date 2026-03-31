@@ -169,3 +169,6 @@ hp_book_*/
 Llama*/
 phi*/
 results/
+
+# nohup output
+nohup.out

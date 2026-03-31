@@ -44,13 +44,13 @@ class WMDP(BaseDataset):
         self.dataset = DatasetDict(
             {
                 "bio": load_dataset(
-                    self.path, "wmdp-bio", keep_in_memory=True, trust_remote_code=True
+                    self.path, "wmdp-bio", keep_in_memory=True
                 )["test"],
                 "chem": load_dataset(
-                    self.path, "wmdp-chem", keep_in_memory=True, trust_remote_code=True
+                    self.path, "wmdp-chem", keep_in_memory=True
                 )["test"],
                 "cyber": load_dataset(
-                    self.path, "wmdp-cyber", keep_in_memory=True, trust_remote_code=True
+                    self.path, "wmdp-cyber", keep_in_memory=True
                 )["test"],
             }
         )
@@ -84,7 +84,7 @@ class WMDP(BaseDataset):
         wmdp_dataset = self.load_dataset_for_eval()
         bio_size, chem_size, cyber_size = [len(wmdp_dataset[s]) for s in self.subjects]
         bio_prompts, chem_prompts, cyber_prompts = [
-            wmdp_dataset[s]["prompt"] for s in self.subjects
+            list(wmdp_dataset[s]["prompt"]) for s in self.subjects
         ]
         prompts = bio_prompts + chem_prompts + cyber_prompts
         labels = [0] * bio_size + [1] * chem_size + [2] * cyber_size
@@ -154,8 +154,8 @@ class WMDP(BaseDataset):
         mmlu_test_dataset = mmlu.load_dataset_for_eval("test")
         retain_dataset = Dataset.from_dict(
             {
-                "text": mmlu_auxiliary_train_subset["prompt"]
-                + mmlu_dev_dataset["prompt"],
+                "text": list(mmlu_auxiliary_train_subset["prompt"])
+                + list(mmlu_dev_dataset["prompt"]),
                 "label": [0] * len(mmlu_auxiliary_train_subset)
                 + [0] * len(mmlu_dev_dataset),
             }
@@ -301,7 +301,7 @@ class WMDPBio(WMDP):
 
     def download(self):
         self.dataset = load_dataset(
-            self.path, "wmdp-bio", keep_in_memory=True, trust_remote_code=True
+            self.path, "wmdp-bio", keep_in_memory=True
         )
 
     def load_dataset_for_eval(
@@ -338,7 +338,7 @@ class WMDPChem(WMDP):
 
     def download(self):
         self.dataset = load_dataset(
-            self.path, "wmdp-chem", keep_in_memory=True, trust_remote_code=True
+            self.path, "wmdp-chem", keep_in_memory=True
         )
 
     def load_dataset_for_eval(
@@ -375,7 +375,7 @@ class WMDPCyber(WMDP):
 
     def download(self):
         self.dataset = load_dataset(
-            self.path, "wmdp-cyber", keep_in_memory=True, trust_remote_code=True
+            self.path, "wmdp-cyber", keep_in_memory=True
         )
 
     def load_dataset_for_eval(

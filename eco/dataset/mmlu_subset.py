@@ -36,7 +36,7 @@ class MMLUSubset(MMLU):
         self.dataset = merge_datasets(
             [
                 load_dataset(
-                    self.path, subject, keep_in_memory=True, trust_remote_code=True
+                    self.path, subject, keep_in_memory=True
                 )
                 for subject in self.subjects
             ]
@@ -265,7 +265,7 @@ class MMLUWithoutEconomicsEconometrics(MMLUSubset):
 
     def download(self):
         all_subsets = load_dataset(
-            self.path, "all", keep_in_memory=True, trust_remote_code=True
+            self.path, "all", keep_in_memory=True
         )
         self.dataset = all_subsets.filter(
             lambda x: x["subject"] not in self.excluded_subjects
@@ -297,7 +297,7 @@ class MMLUWithoutPhysicsMath(MMLUSubset):
 
     def download(self):
         all_subsets = load_dataset(
-            self.path, "all", keep_in_memory=True, trust_remote_code=True
+            self.path, "all", keep_in_memory=True
         )
         self.dataset = all_subsets.filter(
             lambda x: x["subject"] not in self.excluded_subjects
@@ -329,7 +329,7 @@ class MMLUWithoutLawJurisprudence(MMLUSubset):
 
     def download(self):
         all_subsets = load_dataset(
-            self.path, "all", keep_in_memory=True, trust_remote_code=True
+            self.path, "all", keep_in_memory=True
         )
         self.dataset = all_subsets.filter(
             lambda x: x["subject"] not in self.excluded_subjects

@@ -81,7 +81,7 @@ class HPBook(BaseDataset):
         if self.dataset is None:
             self.download()
         forget_dataset = self.dataset["forget"]
-        retain_dataset = load_dataset("swj0419/BookMIA", trust_remote_code=True)[
+        retain_dataset = load_dataset("swj0419/BookMIA")[
             "train"
         ]
         retain_dataset = retain_dataset.filter(
@@ -214,7 +214,7 @@ class HPBook(BaseDataset):
         forget_dataset = Dataset.from_dict(
             {"text": sentences, "label": [1] * len(sentences)}
         )
-        retain_dataset = load_dataset("swj0419/BookMIA", trust_remote_code=True)[
+        retain_dataset = load_dataset("swj0419/BookMIA")[
             "train"
         ]
         retain_dataset = retain_dataset.filter(

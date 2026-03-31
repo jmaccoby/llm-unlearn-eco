@@ -54,11 +54,11 @@ def compute_metrics(eval_pred):
 model_name = "roberta-base"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-if args.dataset == "tofu":
+if args.dataset_name == "tofu":
     assert args.tofu_subset_name is not None, "Must provide tofu_subset_name"
     data_module = dataset_classes[args.dataset_name](tokenizer, max_length=512)
     dataset = data_module.load_dataset_for_classification(args.tofu_subset_name)
-elif args.dataset == "mmlu-subset":
+elif args.dataset_name == "mmlu-subset":
     assert args.mmlu_subset_name is not None, "Must provide mmlu_subset_name"
     subset_to_cls = {
         "economics": [
@@ -95,7 +95,7 @@ print(f"Class weights: {class_weights}")
 
 
 class CustomTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
         logits = outputs.get("logits")
@@ -123,7 +123,7 @@ print(model)
 print(f"Number of parameters: {model.num_parameters()}")
 
 training_args = TrainingArguments(
-    overwrite_output_dir=True,
+    # overwrite_output_dir=True,
     output_dir=f"{args.dataset_name}_classifier",
     learning_rate=args.learning_rate,
     weight_decay=0.1,
@@ -139,7 +139,7 @@ training_args = TrainingArguments(
     logging_strategy="steps",
     logging_steps=1000,
     do_eval=True,
-    evaluation_strategy="steps",
+    eval_strategy="steps",
     eval_steps=1000,
     save_strategy="steps",
     save_steps=1000,
@@ -160,5 +160,6 @@ trainer = CustomTrainer(
     compute_metrics=compute_metrics,
     data_collator=data_collator,
 )
+trainer.model_accepts_loss_kwargs=False
 trainer.train()
 trainer.save_model(f"{args.dataset_name}_classifier")

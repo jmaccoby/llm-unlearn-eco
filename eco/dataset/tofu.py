@@ -31,6 +31,7 @@ class TOFU(BaseDataset):
 
     def __init__(self, formatting_tokens=None, eos_token=None, *args, **kwargs):
         super().__init__()
+        formatting_tokens = None
         self.formatting_tokens = formatting_tokens
         self.eos_token = eos_token if eos_token is not None else ""
         for k in [
@@ -47,7 +48,7 @@ class TOFU(BaseDataset):
 
     def download(self):
         data_subsets = {
-            s: load_dataset(self.path, s, keep_in_memory=True, trust_remote_code=True)[
+            s: load_dataset(self.path, s, keep_in_memory=True)[
                 "train"
             ]
             for s in self.subsets
@@ -97,11 +98,11 @@ class TOFU(BaseDataset):
         forget_dataset = forget_dataset.map(lambda x: {"label": 1})
         train_dataset = Dataset.from_dict(
             {
-                "text": retain_dataset["text"] + forget_dataset["text"],
-                "label": retain_dataset["label"] + forget_dataset["label"],
+                "text": list(retain_dataset["text"]) + list(forget_dataset["text"]),
+                "label": list(retain_dataset["label"]) + list(forget_dataset["label"]),
             }
         )
-        val_dataset = []
+        # val_dataset = []
         if use_val:
             train_dataset = train_dataset.train_test_split(test_size=0.1, seed=42)
             train_dataset, val_dataset = train_dataset["train"], train_dataset["test"]
@@ -112,15 +113,18 @@ class TOFU(BaseDataset):
             [real_authors_dataset, world_facts_dataset]
         )
 
-        return DatasetDict(
+        dataset = DatasetDict(
             {
                 "train": train_dataset,
-                "valid": val_dataset,
+                # "valid": val_dataset,
                 "retain": retain_dataset,
                 "forget": forget_dataset,
                 "test": general_dataset,
             }
         )
+        if use_val:
+            dataset["valid"] = val_dataset
+        return dataset
 
 
 class TOFUPerturbed(TOFU):
@@ -142,7 +146,7 @@ class TOFUPerturbed(TOFU):
 
     def download(self):
         data_subsets = {
-            s: load_dataset(self.path, s, keep_in_memory=True, trust_remote_code=True)[
+            s: load_dataset(self.path, s, keep_in_memory=True)[
                 "train"
             ]
             for s in self.subsets

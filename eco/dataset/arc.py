@@ -48,7 +48,7 @@ class ARCEasy(ARC):
 
     def download(self):
         self.dataset = load_dataset(
-            self.path, "ARC-Easy", keep_in_memory=True, trust_remote_code=True
+            self.path, "ARC-Easy", keep_in_memory=True
         )
 
 
@@ -60,5 +60,5 @@ class ARCChallenge(ARC):
 
     def download(self):
         self.dataset = load_dataset(
-            self.path, "ARC-Challenge", keep_in_memory=True, trust_remote_code=True
+            self.path, "ARC-Challenge", keep_in_memory=True
         )
