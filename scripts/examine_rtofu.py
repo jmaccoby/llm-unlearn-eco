@@ -2,9 +2,9 @@
 Examine model responses to R-TOFU dataset queries.
 
 Usage:
-    python scripts/examine_rtofu.py
-    python scripts/examine_rtofu.py --split forget10 --n 20
-    python scripts/examine_rtofu.py --split full --show_cot --output results/rtofu_responses.csv
+    python -m scripts.examine_rtofu
+    python -m scripts.examine_rtofu --split forget10 --n 20
+    python -m scripts.examine_rtofu --split full --show_cot --output results/rtofu_responses.csv
 """
 import argparse
 import csv
@@ -74,8 +74,9 @@ for i, example in enumerate(examples):
     inputs = tokenizer(question, return_tensors="pt").to(device)
     with torch.no_grad():
         output_ids = model.generate(**inputs, generation_config=model.generation_config)
-    prompt_len = inputs["input_ids"].shape[1]
-    response = tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=True)
+    prompt_decoded = tokenizer.decode(inputs["input_ids"][0], skip_special_tokens=True)
+    full_decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    response = full_decoded[len(prompt_decoded):]
 
     # Print
     idx = args.offset + i
