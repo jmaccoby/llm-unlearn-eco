@@ -74,16 +74,22 @@ for i, example in enumerate(examples):
     inputs = tokenizer(question, return_tensors="pt").to(device)
     with torch.no_grad():
         output_ids = model.generate(**inputs, generation_config=model.generation_config)
-    prompt_decoded = tokenizer.decode(inputs["input_ids"][0], skip_special_tokens=True)
-    full_decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    response = full_decoded[len(prompt_decoded):]
+    full = tokenizer.decode(output_ids[0], skip_special_tokens=False)
+    # Split on <think>\n to discard the prompt, then re-encode/decode to resolve BPE characters
+    raw = full.split("<think>\n", 1)[1] if "<think>\n" in full else full
+    raw = tokenizer.decode(tokenizer.encode(raw), skip_special_tokens=True)
+    # Extract final answer after the reasoning block
+    think_block, response = raw.split("</think>\n\n", 1) if "</think>\n\n" in raw else ("", raw)
 
     # Print
     idx = args.offset + i
     print(f"[{idx}] QUESTION:\n{question}\n")
     print(f"GOLD ANSWER:\n{gold_answer}\n")
-    if args.show_cot and cot:
-        print(f"GOLD COT:\n{cot}\n")
+    if args.show_cot:
+        if think_block:
+            print(f"MODEL THINKING:\n{think_block.removeprefix('<think>').strip()}\n")
+        if cot:
+            print(f"GOLD COT:\n{cot}\n")
     print(f"MODEL RESPONSE:\n{response}\n")
     print("-" * 80)
 
