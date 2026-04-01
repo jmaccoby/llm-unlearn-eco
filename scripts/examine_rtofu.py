@@ -101,12 +101,13 @@ for i, example in enumerate(examples):
     gold_answer = example["answer"]
     cot = example.get("cot", "")
 
-    # Generate response
-    inputs = tokenizer(question, return_tensors="pt").to(device)
+    # Generate response, forcing the model to begin with a reasoning block
+    prompt_len = len(tokenizer.encode(question))
+    inputs = tokenizer(question + "<think>\n", return_tensors="pt").to(device)
     with torch.no_grad():
         output_ids = model.generate(**inputs, generation_config=model.generation_config)
-    prompt_len = inputs["input_ids"].shape[1]
-    # Slice to new tokens only, then apply inverse BPE byte mapping to resolve Ġ/Ċ characters
+    # Slice to new tokens only (after the original question, keeping the <think> prefix),
+    # then apply inverse BPE byte mapping to resolve Ġ/Ċ characters
     raw = tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=True)
     raw = fix_bpe(raw)
     # Extract final answer after the reasoning block

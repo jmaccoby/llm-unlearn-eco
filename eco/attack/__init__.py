@@ -1,2 +1,2 @@
 from .classifier import PromptClassifier, TokenClassifier
-from .model import AttackedModel
+from .model import AttackedModel, AttackedReasoningModel
