@@ -172,3 +172,6 @@ results/
 
 # nohup output
 nohup.out
+
+# Claude
+CLAUDE.md

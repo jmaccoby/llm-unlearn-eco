@@ -166,4 +166,7 @@ trainer = CustomTrainer(
 )
 trainer.model_accepts_loss_kwargs=False
 trainer.train()
-trainer.save_model(f"{args.dataset_name}_classifier")
+if args.dataset_name in {"tofu", "rtofu"}:
+    trainer.save_model(f"{args.dataset_name}_classifiers/{args.tofu_subset_name}")
+else:
+    trainer.save_model(f"{args.dataset_name}_classifier")
