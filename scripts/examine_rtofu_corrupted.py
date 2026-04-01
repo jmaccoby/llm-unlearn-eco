@@ -69,6 +69,7 @@ parser.add_argument("--corrupt_method", type=str, required=True, help="Corruptio
 parser.add_argument("--dims", type=int, required=True, help="Number of embedding dimensions to corrupt")
 parser.add_argument("--strength", type=float, default=None, help="Corruption strength (required for noise/value methods)")
 parser.add_argument("--classifier_threshold", type=float, default=0.99, help="Prompt classifier confidence threshold")
+parser.add_argument("--repetition_penalty", type=float, default=None, help="Repetition penalty for generation (try 1.2-1.5 to reduce looping)")
 args = parser.parse_args()
 
 # Load model via HFModel
@@ -78,6 +79,8 @@ generation_config = GenerationConfig(
     max_new_tokens=args.max_new_tokens,
     use_cache=True,
 )
+if args.repetition_penalty is not None:
+    generation_config.repetition_penalty = args.repetition_penalty
 model = HFModel(
     model_name=MODEL_NAME,
     config_path="./config/rtofu_model_config",

@@ -41,13 +41,13 @@ print(f"Dataset size: {len(dataset)}")
 try:
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
         trust_remote_code=True,
     )
 except:
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.bfloat16, trust_remote_code=True
+        model_name, dtype=torch.bfloat16, trust_remote_code=True
     )
 model.generation_config = GenerationConfig()
 print(f"Total parameters: {model.num_parameters()}")

@@ -63,7 +63,7 @@ print(create_tasks_table(config))
 
 reference_model = AutoModelForCausalLM.from_pretrained(
     f"{args.dataset_name}_{args.model_name}",
-    torch_dtype=torch.bfloat16,
+    dtype=torch.bfloat16,
     attn_implementation=model_config["attn_implementation"],
     device_map="cuda:0",
     trust_remote_code=True,

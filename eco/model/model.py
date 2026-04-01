@@ -28,7 +28,7 @@ class HFModel:
             else None
         )
         model_args = {
-            "torch_dtype": torch.bfloat16,
+            "dtype": torch.bfloat16,
             "attn_implementation": self.model_config["attn_implementation"],
             "device_map": "auto",
             "quantization_config": quantization_config,

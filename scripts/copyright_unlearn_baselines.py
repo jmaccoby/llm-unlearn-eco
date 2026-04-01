@@ -302,7 +302,7 @@ print(f"Dataset size: {len(dataset)}")
 
 model = AutoModelForCausalLM.from_pretrained(
     model_path,
-    torch_dtype=torch.bfloat16,
+    dtype=torch.bfloat16,
     attn_implementation=model_config["attn_implementation"],
     trust_remote_code=True,
 )
@@ -310,7 +310,7 @@ reference_model = None
 if args.loss in ["kl", "llmu", "scrub"]:
     reference_model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         attn_implementation=model_config["attn_implementation"],
         trust_remote_code=True,
         device_map="auto",
