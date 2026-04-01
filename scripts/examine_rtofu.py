@@ -74,9 +74,9 @@ for i, example in enumerate(examples):
     inputs = tokenizer(question, return_tensors="pt").to(device)
     with torch.no_grad():
         output_ids = model.generate(**inputs, generation_config=model.generation_config)
-    full = tokenizer.decode(output_ids[0], skip_special_tokens=False)
-    # Split on <think>\n to discard the prompt, then re-encode/decode to resolve BPE characters
-    raw = full.split("<think>\n", 1)[1] if "<think>\n" in full else full
+    prompt_len = inputs["input_ids"].shape[1]
+    # Slice to new tokens only, then re-encode/decode to resolve byte-level BPE characters (Ġ, Ċ, etc.)
+    raw = tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=True)
     raw = tokenizer.decode(tokenizer.encode(raw), skip_special_tokens=True)
     # Extract final answer after the reasoning block
     think_block, response = raw.split("</think>\n\n", 1) if "</think>\n\n" in raw else ("", raw)
