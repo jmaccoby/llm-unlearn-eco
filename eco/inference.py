@@ -304,6 +304,59 @@ class ReasoningGenerationEngine(GenerationEngine):
     THINK_PREFIX = "<think>\n"
     THINK_SUFFIX = "</think>\n\n"
 
+    def __init__(self, *args, max_retries=3, retry_token_multiplier=2, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_retries = max_retries
+        self.retry_token_multiplier = retry_token_multiplier
+
+    def _generate_single(self, prompt, max_new_tokens):
+        """Generate a single response with a specific token limit."""
+        model_handles_think = isinstance(self.model, AttackedReasoningModel)
+
+        tokenized = self.tokenizer(
+            prompt, return_tensors="pt", truncation=True, max_length=256
+        ).to(self.model.device)
+        prompt_len = tokenized["input_ids"].shape[1]
+
+        if not model_handles_think:
+            think_ids = self.tokenizer(
+                self.THINK_PREFIX, add_special_tokens=False, return_tensors="pt"
+            )["input_ids"].to(self.model.device)
+            tokenized["input_ids"] = torch.cat(
+                [tokenized["input_ids"], think_ids], dim=1
+            )
+            tokenized["attention_mask"] = torch.cat(
+                [tokenized["attention_mask"], torch.ones_like(think_ids)], dim=1
+            )
+
+        from copy import deepcopy
+        gen_config = deepcopy(self.model.generation_config)
+        gen_config.max_new_tokens = max_new_tokens
+
+        generated = self.model.generate(
+            **tokenized,
+            prompts=[prompt],
+            generation_config=gen_config,
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+        remove_hooks(self.model.model)
+
+        raw = self.tokenizer.decode(generated[0][prompt_len:], skip_special_tokens=True)
+        return fix_bpe(raw)
+
+    def _retry_generation(self, prompt, original_response, base_max_tokens):
+        """Retry generation with increasing token limits for empty answers."""
+        max_tokens = base_max_tokens
+        for attempt in range(self.max_retries):
+            max_tokens = int(max_tokens * self.retry_token_multiplier)
+            resp = self._generate_single(prompt, max_tokens)
+            if self.THINK_SUFFIX in resp:
+                cot, answer = resp.split(self.THINK_SUFFIX, 1)
+                return cot, answer
+        # All retries exhausted — treat full response as CoT
+        return original_response, ""
+
     def _generate(self):
         self.prepare_dataset()
         padding_side = self.tokenizer.padding_side
@@ -376,16 +429,21 @@ class ReasoningGenerationEngine(GenerationEngine):
 
                 # Split into CoT and answer at </think>\n\n
                 # If delimiter is missing (e.g. truncated by max_new_tokens),
-                # the entire response is treated as CoT with an empty answer.
+                # retry with more tokens before falling back to empty answer.
                 batch_cot, batch_answer = [], []
-                for resp in batch_responses:
+                for idx, resp in enumerate(batch_responses):
                     if self.THINK_SUFFIX in resp:
                         cot, answer = resp.split(self.THINK_SUFFIX, 1)
                         batch_cot.append(cot)
                         batch_answer.append(answer)
                     else:
-                        batch_cot.append(resp)
-                        batch_answer.append("")
+                        cot, answer = self._retry_generation(
+                            prompts[idx], resp, self.model.generation_config.max_new_tokens
+                        )
+                        batch_cot.append(cot)
+                        batch_answer.append(answer)
+                        if answer:
+                            batch_responses[idx] = cot + self.THINK_SUFFIX + answer
 
                 # Clean up gold answers
                 gold_answers = self.tokenizer.batch_decode(
