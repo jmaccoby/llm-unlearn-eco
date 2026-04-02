@@ -4,6 +4,8 @@ from .bleu import BLEU
 from .bleurt import BLEURT
 from .choice_by_top_logit import ChoiceByTopLogit
 from .choice_by_top_prob import ChoiceByTopProb
+from .cosine_similarity import CosineSimilarity
+from .entailment_score import EntailmentScore
 from .exact_match import ExactMatch
 from .meteor import METEOR
 from .normalized_answer_prob import NormalizedAnswerProb
@@ -11,6 +13,7 @@ from .perplexity import Perplexity
 from .rouge import ROUGE
 from .rouge_recall import ROUGERecall
 from .sacrebleu import SacreBLEU
+from .token_entropy import TokenEntropy
 from .truth_ratio import TruthRatio
 from .unique_token_ratio import UniqueTokenRatio
 
@@ -23,6 +26,8 @@ evaluator_classes = {
         BLEURT,
         ChoiceByTopLogit,
         ChoiceByTopProb,
+        CosineSimilarity,
+        EntailmentScore,
         ExactMatch,
         METEOR,
         NormalizedAnswerProb,
@@ -30,6 +35,7 @@ evaluator_classes = {
         ROUGE,
         ROUGERecall,
         SacreBLEU,
+        TokenEntropy,
         TruthRatio,
         UniqueTokenRatio,
     ]

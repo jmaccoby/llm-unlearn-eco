@@ -1,10 +1,12 @@
 import time
 
 import numpy as np
-from tabulate import tabulate
+import torch
 from tqdm import tqdm
 
+from eco.attack.model import AttackedReasoningModel
 from eco.attack.utils import remove_hooks
+from eco.utils import fix_bpe
 
 
 class InferenceEngine:
@@ -285,3 +287,159 @@ class GenerationEngine(InferenceEngine):
             truncated_gold.append(gold_answer[:min_len])
             truncated_generated.append(generated_answer[:min_len])
         return truncated_gold, truncated_generated
+
+
+class ReasoningGenerationEngine(GenerationEngine):
+    """GenerationEngine for reasoning models (e.g. DeepSeek-R1).
+
+    Appends a ``<think>\\n`` prefix to force reasoning, applies BPE fix to
+    decoded outputs, and splits responses into CoT and answer portions at
+    the ``</think>\\n\\n`` delimiter.
+
+    After ``inference()`` completes, ``cot_generations`` and
+    ``answer_generations`` are available as dicts keyed by
+    ``{dataset_name}_{subset_name}``.
+    """
+
+    THINK_PREFIX = "<think>\n"
+    THINK_SUFFIX = "</think>\n\n"
+
+    def _generate(self):
+        self.prepare_dataset()
+        padding_side = self.tokenizer.padding_side
+        if self.tokenizer.padding_side != "left":
+            self.tokenizer.padding_side = "left"
+
+        # AttackedReasoningModel already appends the think prefix
+        model_handles_think = isinstance(self.model, AttackedReasoningModel)
+
+        subsets_generations = {}
+        for subset_name, dataset in self.datasets.items():
+            all_gold_answers, all_generated_answers = [], []
+            all_generated_cot, all_generated_answer = [], []
+            all_prompts = []
+            total_time, total_examples = 0, 0
+
+            for batch in tqdm(
+                dataset,
+                desc=f"Generating completions of {self.data_module.name} on {subset_name}",
+                total=len(dataset),
+            ):
+                remove_hooks(self.model.model)
+                prompts = batch[self.data_module.gen_prompt_key]
+                gold_answers = batch[self.data_module.gen_answer_key]
+
+                tokenized_prompts = self.tokenizer(
+                    prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=256,
+                ).to(self.model.device)
+                prompt_len = tokenized_prompts["input_ids"].shape[1]
+
+                if not model_handles_think:
+                    think_ids = self.tokenizer(
+                        self.THINK_PREFIX,
+                        add_special_tokens=False,
+                        return_tensors="pt",
+                    )["input_ids"].to(self.model.device)
+                    batch_size = tokenized_prompts["input_ids"].shape[0]
+                    tokenized_prompts["input_ids"] = torch.cat(
+                        [tokenized_prompts["input_ids"], think_ids.expand(batch_size, -1)],
+                        dim=1,
+                    )
+                    tokenized_prompts["attention_mask"] = torch.cat(
+                        [tokenized_prompts["attention_mask"], torch.ones_like(think_ids).expand(batch_size, -1)],
+                        dim=1,
+                    )
+
+                start_time = time.perf_counter()
+                generated = self.model.generate(
+                    **tokenized_prompts,
+                    prompts=prompts,
+                    generation_config=self.model.generation_config,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+                end_time = time.perf_counter()
+                total_time += end_time - start_time
+                total_examples += len(prompts)
+
+                # Decode only new tokens (after original prompt), apply BPE fix
+                batch_responses = []
+                for i in range(generated.shape[0]):
+                    raw = self.tokenizer.decode(
+                        generated[i][prompt_len:], skip_special_tokens=True
+                    )
+                    batch_responses.append(fix_bpe(raw))
+
+                # Split into CoT and answer at </think>\n\n
+                # If delimiter is missing (e.g. truncated by max_new_tokens),
+                # the entire response is treated as CoT with an empty answer.
+                batch_cot, batch_answer = [], []
+                for resp in batch_responses:
+                    if self.THINK_SUFFIX in resp:
+                        cot, answer = resp.split(self.THINK_SUFFIX, 1)
+                        batch_cot.append(cot)
+                        batch_answer.append(answer)
+                    else:
+                        batch_cot.append(resp)
+                        batch_answer.append("")
+
+                # Clean up gold answers
+                gold_answers = self.tokenizer.batch_decode(
+                    self.tokenizer(gold_answers, add_special_tokens=False).input_ids,
+                    skip_special_tokens=True,
+                )
+
+                all_gold_answers.append(gold_answers)
+                all_generated_answers.append(batch_responses)
+                all_generated_cot.append(batch_cot)
+                all_generated_answer.append(batch_answer)
+                all_prompts.append(prompts)
+                remove_hooks(self.model.model)
+
+            subsets_generations[subset_name] = {
+                "prompt": all_prompts,
+                "gold": all_gold_answers,
+                "generated": all_generated_answers,
+                "generated_cot": all_generated_cot,
+                "generated_answer": all_generated_answer,
+            }
+
+        self.tokenizer.padding_side = padding_side
+        return subsets_generations
+
+    def inference(self):
+        self.results = []
+        answers = self._generate()
+        self.text_generations = {}
+        self.cot_generations = {}
+        self.answer_generations = {}
+
+        for subset_name, data in answers.items():
+            key = f"{self.data_module.name}_{subset_name}"
+
+            data_gold = [item for sublist in data["gold"] for item in sublist]
+            data_generated = [item for sublist in data["generated"] for item in sublist]
+            data_cot = [item for sublist in data["generated_cot"] for item in sublist]
+            data_answer = [item for sublist in data["generated_answer"] for item in sublist]
+
+            self.text_generations[key] = {"gold": data_gold, "generated": data_generated}
+            self.cot_generations[key] = {"gold": data_gold, "generated": data_cot}
+            self.answer_generations[key] = {"gold": data_gold, "generated": data_answer}
+
+            # Run evaluators on answer portions (AFE)
+            for evaluator in self.evaluator:
+                evaluator_outputs = []
+                for gold, generated_answer in tqdm(
+                    zip(data["gold"], data["generated_answer"]),
+                    total=len(data["gold"]),
+                    desc=f"Evaluating {evaluator.name} of {self.data_module.name} on {subset_name}",
+                ):
+                    outputs = evaluator.evaluate(gold, generated_answer)
+                    evaluator_outputs.extend(outputs)
+                self.results.append(
+                    {f"{self.data_module.name}_{subset_name}_{evaluator.name}": evaluator_outputs}
+                )

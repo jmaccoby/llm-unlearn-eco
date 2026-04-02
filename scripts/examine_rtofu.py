@@ -13,37 +13,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 from eco.dataset.rtofu import RTOFU
-
-
-def _build_byte_decoder():
-    """Inverse of GPT-2's bytes_to_unicode(): maps BPE unicode chars back to bytes."""
-    bs = (
-        list(range(ord("!"), ord("~") + 1))
-        + list(range(ord("¡"), ord("¬") + 1))
-        + list(range(ord("®"), ord("ÿ") + 1))
-    )
-    cs = bs[:]
-    n = 0
-    for b in range(2**8):
-        if b not in bs:
-            bs.append(b)
-            cs.append(2**8 + n)
-            n += 1
-    return {chr(c): b for b, c in zip(bs, cs)}
-
-
-_BYTE_DECODER = _build_byte_decoder()
-
-
-def fix_bpe(text):
-    """Convert byte-level BPE characters (e.g. Ġ→space, Ċ→newline) to real bytes."""
-    result = []
-    for c in text:
-        if c in _BYTE_DECODER:
-            result.append(_BYTE_DECODER[c])
-        else:
-            result.extend(c.encode("utf-8"))
-    return bytes(result).decode("utf-8", errors="replace")
+from eco.utils import fix_bpe
 
 MODEL_PATH = "sangyon/LRM-target"
 
@@ -111,7 +81,7 @@ for i, example in enumerate(examples):
     raw = tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=True)
     raw = fix_bpe(raw)
     # Extract final answer after the reasoning block
-    think_block, response = raw.split("</think>\n\n", 1) if "</think>\n\n" in raw else ("", raw)
+    think_block, response = raw.split("</think>\n\n", 1) if "</think>\n\n" in raw else (raw, "")
 
     # Print
     idx = args.offset + i
