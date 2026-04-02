@@ -30,6 +30,7 @@ parser.add_argument(
     help="R-TOFU forget split to evaluate",
 )
 parser.add_argument("--model_name", type=str, default="LRM-target")
+parser.add_argument("--num_examples", type=int, default=0, help="Number of examples per subset to evaluate (0 = all)")
 parser.add_argument("--batch_size", type=int, default=8)
 parser.add_argument("--max_new_tokens", type=int, default=512)
 parser.add_argument("--classifier_threshold", type=float, default=0.99)
@@ -89,6 +90,13 @@ rtofu.download()
 
 retain_split = RTOFU.match_retain[args.split]
 subset_names = [args.split, retain_split]
+
+# Optionally limit the number of examples per subset
+if args.num_examples > 0:
+    for name in subset_names:
+        n = min(args.num_examples, len(rtofu.dataset[name]))
+        rtofu.dataset[name] = rtofu.dataset[name].select(range(n))
+
 print(f"Evaluating on subsets: {subset_names}")
 
 # AFE evaluators
