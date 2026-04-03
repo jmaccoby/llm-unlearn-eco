@@ -304,8 +304,35 @@ class ReasoningGenerationEngine(GenerationEngine):
     THINK_PREFIX = "<think>\n"
     THINK_SUFFIX = "</think>\n\n"
 
-    def __init__(self, *args, max_retries=3, retry_token_multiplier=2, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        data_module,
+        subset_names,
+        answer_evaluator,
+        cot_evaluator=None,
+        batch_size=64,
+        prompt_prefix="",
+        comparison_length=128,
+        truncate_answers=False,
+        max_retries=3,
+        retry_token_multiplier=2,
+    ):
+        super().__init__(
+            model,
+            tokenizer,
+            data_module,
+            subset_names,
+            answer_evaluator,
+            batch_size,
+            prompt_prefix,
+            comparison_length,
+            truncate_answers,
+        )
+        self.cot_evaluator = cot_evaluator or []
+        if not isinstance(self.cot_evaluator, list):
+            self.cot_evaluator = [self.cot_evaluator]
         self.max_retries = max_retries
         self.retry_token_multiplier = retry_token_multiplier
 
@@ -368,7 +395,7 @@ class ReasoningGenerationEngine(GenerationEngine):
 
         subsets_generations = {}
         for subset_name, dataset in self.datasets.items():
-            all_gold_answers, all_generated_answers = [], []
+            all_gold_answers, all_gold_cots, all_generated_answers = [], [], []
             all_generated_cot, all_generated_answer = [], []
             all_prompts = []
             total_time, total_examples = 0, 0
@@ -445,13 +472,15 @@ class ReasoningGenerationEngine(GenerationEngine):
                         if answer:
                             batch_responses[idx] = cot + self.THINK_SUFFIX + answer
 
-                # Clean up gold answers
-                gold_answers = self.tokenizer.batch_decode(
-                    self.tokenizer(gold_answers, add_special_tokens=False).input_ids,
-                    skip_special_tokens=True,
-                )
+                # Gold answers are plain text from the dataset — no special
+                # tokens to strip.  Skipping the tokenize/decode roundtrip
+                # avoids a lossy encode (this tokenizer merges "full name"
+                # into a single "fullname" token, dropping the space).
+
+                gold_cots = batch.get(getattr(self.data_module, "gen_cot_key", None), [""] * len(prompts))
 
                 all_gold_answers.append(gold_answers)
+                all_gold_cots.append(gold_cots)
                 all_generated_answers.append(batch_responses)
                 all_generated_cot.append(batch_cot)
                 all_generated_answer.append(batch_answer)
@@ -460,7 +489,8 @@ class ReasoningGenerationEngine(GenerationEngine):
 
             subsets_generations[subset_name] = {
                 "prompt": all_prompts,
-                "gold": all_gold_answers,
+                "gold_answer": all_gold_answers,
+                "gold_cot": all_gold_cots,
                 "generated": all_generated_answers,
                 "generated_cot": all_generated_cot,
                 "generated_answer": all_generated_answer,
@@ -479,25 +509,40 @@ class ReasoningGenerationEngine(GenerationEngine):
         for subset_name, data in answers.items():
             key = f"{self.data_module.name}_{subset_name}"
 
-            data_gold = [item for sublist in data["gold"] for item in sublist]
+            data_gold_answer = [item for sublist in data["gold_answer"] for item in sublist]
+            data_gold_cot = [item for sublist in data["gold_cot"] for item in sublist]
             data_generated = [item for sublist in data["generated"] for item in sublist]
             data_cot = [item for sublist in data["generated_cot"] for item in sublist]
             data_answer = [item for sublist in data["generated_answer"] for item in sublist]
 
-            self.text_generations[key] = {"gold": data_gold, "generated": data_generated}
-            self.cot_generations[key] = {"gold": data_gold, "generated": data_cot}
-            self.answer_generations[key] = {"gold": data_gold, "generated": data_answer}
+            self.text_generations[key] = {"gold": data_gold_answer, "generated": data_generated}
+            self.cot_generations[key] = {"gold": data_gold_cot, "generated": data_cot}
+            self.answer_generations[key] = {"gold": data_gold_answer, "generated": data_answer}
 
-            # Run evaluators on answer portions (AFE)
+            # Run answer evaluators (AFE)
             for evaluator in self.evaluator:
                 evaluator_outputs = []
                 for gold, generated_answer in tqdm(
-                    zip(data["gold"], data["generated_answer"]),
-                    total=len(data["gold"]),
+                    zip(data["gold_answer"], data["generated_answer"]),
+                    total=len(data["gold_answer"]),
                     desc=f"Evaluating {evaluator.name} of {self.data_module.name} on {subset_name}",
                 ):
                     outputs = evaluator.evaluate(gold, generated_answer)
                     evaluator_outputs.extend(outputs)
                 self.results.append(
                     {f"{self.data_module.name}_{subset_name}_{evaluator.name}": evaluator_outputs}
+                )
+
+            # Run CoT evaluators (CFE)
+            for evaluator in self.cot_evaluator:
+                evaluator_outputs = []
+                for gold_cot, generated_cot in tqdm(
+                    zip(data["gold_cot"], data["generated_cot"]),
+                    total=len(data["gold_cot"]),
+                    desc=f"Evaluating {evaluator.name} (CoT) of {self.data_module.name} on {subset_name}",
+                ):
+                    outputs = evaluator.evaluate(gold_cot, generated_cot)
+                    evaluator_outputs.extend(outputs)
+                self.results.append(
+                    {f"{self.data_module.name}_{subset_name}_cot_{evaluator.name}": evaluator_outputs}
                 )

@@ -10,7 +10,6 @@ import argparse
 import json
 import os
 
-import numpy as np
 from scipy.stats import hmean
 from transformers import GenerationConfig
 
@@ -39,6 +38,7 @@ parser.add_argument("--dims", type=int, default=None)
 parser.add_argument("--strength", type=float, default=None)
 parser.add_argument("--repetition_penalty", type=float, default=None)
 parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--eval_retain", action="store_true", help="Also evaluate on the matched retain split")
 parser.add_argument("--output_dir", type=str, default="results/rtofu")
 args = parser.parse_args()
 
@@ -88,8 +88,9 @@ rtofu = RTOFU(
 )
 rtofu.download()
 
-retain_split = RTOFU.match_retain[args.split]
-subset_names = [args.split, retain_split]
+subset_names = [args.split]
+if args.eval_retain:
+    subset_names.append(RTOFU.match_retain[args.split])
 
 # Optionally limit the number of examples per subset
 if args.num_examples > 0:
@@ -99,52 +100,36 @@ if args.num_examples > 0:
 
 print(f"Evaluating on subsets: {subset_names}")
 
-# AFE evaluators
-afe_evaluators = [
+# Answer evaluators (AFE)
+answer_evaluators = [
     ROUGERecall(mode="rougeL"),
     CosineSimilarity(),
     EntailmentScore(reverse=False),
     TokenEntropy(tokenizer=model.tokenizer),
 ]
 
-# Run generation + AFE evaluation
-afe_engine = ReasoningGenerationEngine(
+# CoT evaluators (CFE)
+cot_evaluators = [
+    ROUGERecall(mode="rougeL"),
+    CosineSimilarity(),
+]
+
+# Run generation + evaluation
+engine = ReasoningGenerationEngine(
     model=model,
     tokenizer=model.tokenizer,
     data_module=rtofu,
     subset_names=subset_names,
-    evaluator=afe_evaluators,
+    answer_evaluator=answer_evaluators,
+    cot_evaluator=cot_evaluators,
     batch_size=args.batch_size,
 )
-afe_engine.inference()
-afe_summary, afe_outputs = afe_engine.summary()
-
-# CFE: run evaluators on CoT portions (compare generated CoT vs gold CoT)
-cfe_evaluators = [
-    ROUGERecall(mode="rougeL"),
-    CosineSimilarity(),
-    EntailmentScore(reverse=False),
-]
-
-# Load gold CoT from dataset for each subset
-gold_cots = {}
-for subset_name in subset_names:
-    dataset = rtofu.dataset[subset_name]
-    gold_cots[f"rtofu_{subset_name}"] = [ex.get("cot", "") for ex in dataset]
-
-cfe_results = []
-for key, cot_data in afe_engine.cot_generations.items():
-    gold_cot = gold_cots.get(key, cot_data["gold"])
-    for evaluator in cfe_evaluators:
-        scores = evaluator.evaluate(gold_cot, cot_data["generated"])
-        result_key = f"{key}_cot_{evaluator.name}"
-        cfe_results.append({result_key: scores})
-        avg = float(np.mean(scores))
-        print({result_key: avg})
+engine.inference()
+summary, outputs = engine.summary()
 
 # Compute aggregate scores
 all_results = {}
-for r in afe_summary + [{k: float(np.mean(v)) for k, v in d.items()} for d in cfe_results]:
+for r in summary:
     all_results.update(r)
 
 # AFE = hmean(1 - forget_rouge, 1 - forget_cosine, 1 - forget_entailment)
@@ -160,9 +145,10 @@ if afe_forget_scores and all(s > 0 for s in afe_forget_scores):
     all_results["AFE"] = float(hmean(afe_forget_scores))
     print(f"AFE: {all_results['AFE']:.4f}")
 
-# CFE = hmean(1 - forget_cot_rouge, 1 - forget_cot_cosine, 1 - forget_cot_entailment)
+# CFE = hmean(1 - forget_cot_rouge, 1 - forget_cot_cosine)
+cfe_metrics = ["rougeL_recall", "cosine_similarity"]
 cfe_forget_scores = []
-for metric in afe_metrics:
+for metric in cfe_metrics:
     key = f"{forget_prefix}_cot_{metric}"
     if key in all_results:
         cfe_forget_scores.append(1.0 - all_results[key])

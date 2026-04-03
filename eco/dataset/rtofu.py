@@ -21,11 +21,12 @@ class RTOFU(BaseDataset):
         "forget05": "retain90",
         "forget10": "retain90",
     }
-    keys = ["prompt", "answer", "prompt_formatted"]
+    keys = ["prompt", "answer", "prompt_formatted", "cot"]
     eval_prompt_key = "prompt_formatted"
     eval_answer_key = "answer"
     gen_prompt_key = "prompt_formatted"
     gen_answer_key = "answer"
+    gen_cot_key = "cot"
     eval_dataset_keys = ["retain", "forget", "test"]
 
     def __init__(self, formatting_tokens=None, eos_token=None, *args, **kwargs):
