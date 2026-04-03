@@ -3,7 +3,7 @@ Examine model responses to R-TOFU dataset queries.
 
 Usage:
     python -m scripts.examine_rtofu
-    python -m scripts.examine_rtofu --split forget10 --n 20
+    python -m scripts.examine_rtofu --split forget10 --num_examples 20
     python -m scripts.examine_rtofu --split full --show_cot --output results/rtofu_responses.csv
 """
 import argparse
@@ -25,7 +25,7 @@ parser.add_argument(
     choices=["full", "retain90", "retain50", "retain10", "forget01", "forget05", "forget10"],
     help="R-TOFU split to query",
 )
-parser.add_argument("--n", type=int, default=10, help="Number of examples to examine (0 = all)")
+parser.add_argument("--num_examples", type=int, default=10, help="Number of examples to examine (0 = all)")
 parser.add_argument("--offset", type=int, default=0, help="Start from this index")
 parser.add_argument("--max_new_tokens", type=int, default=200)
 parser.add_argument("--show_cot", action="store_true", help="Also print the gold chain-of-thought")
@@ -58,7 +58,7 @@ data_module = RTOFU()
 data_module.download()
 dataset = data_module.dataset[args.split]
 
-end = len(dataset) if args.n == 0 else min(args.offset + args.n, len(dataset))
+end = len(dataset) if args.num_examples == 0 else min(args.offset + args.num_examples, len(dataset))
 examples = dataset.select(range(args.offset, end))
 
 print(f"\nExamining {len(examples)} examples from split '{args.split}'\n")
