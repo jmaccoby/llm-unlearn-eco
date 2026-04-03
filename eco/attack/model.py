@@ -103,7 +103,10 @@ class AttackedModel:
             raw_prompt = []
             for p in prompt:
                 if p.startswith(prompt_prefix) and p.endswith(prompt_suffix):
-                    raw_prompt.append(p[len(prompt_prefix) : -len(prompt_suffix)])
+                    stripped = p[len(prompt_prefix):]
+                    if prompt_suffix:
+                        stripped = stripped[:-len(prompt_suffix)]
+                    raw_prompt.append(stripped)
                 else:
                     raw_prompt.append(p)
         else:

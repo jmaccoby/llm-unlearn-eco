@@ -31,7 +31,6 @@ class TOFU(BaseDataset):
 
     def __init__(self, formatting_tokens=None, eos_token=None, *args, **kwargs):
         super().__init__()
-        formatting_tokens = None
         self.formatting_tokens = formatting_tokens
         self.eos_token = eos_token if eos_token is not None else ""
         for k in [

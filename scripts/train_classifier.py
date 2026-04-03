@@ -56,7 +56,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_name)
 
 if args.dataset_name == "tofu":
     assert args.tofu_subset_name is not None, "Must provide tofu_subset_name"
-    data_module = dataset_classes[args.dataset_name](tokenizer, max_length=512)
+    data_module = dataset_classes[args.dataset_name]()
     dataset = data_module.load_dataset_for_classification(args.tofu_subset_name)
 elif args.dataset_name == "rtofu":
     assert args.tofu_subset_name is not None, "Must provide tofu_subset_name"
