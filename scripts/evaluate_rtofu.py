@@ -15,7 +15,14 @@ from transformers import GenerationConfig
 
 from eco.attack import AttackedReasoningModel, PromptClassifier
 from eco.dataset.rtofu import RTOFU
-from eco.evaluator import CosineSimilarity, EntailmentScore, ROUGERecall, TokenEntropy
+from eco.evaluator import (
+    CosineSimilarity,
+    EntailmentScore,
+    ROUGERecall,
+    StepWiseCosineSimilarity,
+    StepWiseROUGERecall,
+    TokenEntropy,
+)
 from eco.inference import ReasoningGenerationEngine
 from eco.model import HFModel
 from eco.utils import seed_everything
@@ -108,10 +115,10 @@ answer_evaluators = [
     TokenEntropy(tokenizer=model.tokenizer),
 ]
 
-# CoT evaluators (CFE)
+# CoT evaluators (CFE) — step-wise best-match alignment per sentence
 cot_evaluators = [
-    ROUGERecall(mode="rougeL"),
-    CosineSimilarity(),
+    StepWiseROUGERecall(mode="rougeL"),
+    StepWiseCosineSimilarity(),
 ]
 
 # Run generation + evaluation
@@ -146,7 +153,7 @@ if afe_forget_scores and all(s > 0 for s in afe_forget_scores):
     print(f"AFE: {all_results['AFE']:.4f}")
 
 # CFE = hmean(1 - forget_cot_rouge, 1 - forget_cot_cosine)
-cfe_metrics = ["rougeL_recall", "cosine_similarity"]
+cfe_metrics = ["stepwise_rougeL_recall", "stepwise_cosine_similarity"]
 cfe_forget_scores = []
 for metric in cfe_metrics:
     key = f"{forget_prefix}_cot_{metric}"

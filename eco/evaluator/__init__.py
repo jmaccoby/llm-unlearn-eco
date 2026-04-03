@@ -13,6 +13,8 @@ from .perplexity import Perplexity
 from .rouge import ROUGE
 from .rouge_recall import ROUGERecall
 from .sacrebleu import SacreBLEU
+from .stepwise_cosine_similarity import StepWiseCosineSimilarity
+from .stepwise_rouge_recall import StepWiseROUGERecall
 from .token_entropy import TokenEntropy
 from .truth_ratio import TruthRatio
 from .unique_token_ratio import UniqueTokenRatio
@@ -35,6 +37,8 @@ evaluator_classes = {
         ROUGE,
         ROUGERecall,
         SacreBLEU,
+        StepWiseCosineSimilarity,
+        StepWiseROUGERecall,
         TokenEntropy,
         TruthRatio,
         UniqueTokenRatio,

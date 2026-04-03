@@ -10,7 +10,14 @@ import torch.nn as nn
 from transformers import AutoTokenizer, GenerationConfig
 
 from eco.dataset.rtofu import RTOFU
-from eco.evaluator import CosineSimilarity, EntailmentScore, ROUGERecall, TokenEntropy
+from eco.evaluator import (
+    CosineSimilarity,
+    EntailmentScore,
+    ROUGERecall,
+    StepWiseCosineSimilarity,
+    StepWiseROUGERecall,
+    TokenEntropy,
+)
 from eco.inference import ReasoningGenerationEngine
 
 
@@ -313,3 +320,75 @@ class TestEvaluators:
         evaluator = TokenEntropy(tokenizer=tokenizer)
         scores = evaluator.evaluate(["ignored"], [""])
         assert scores[0] == 0.0
+
+
+class TestStepWiseEvaluators:
+    """Tests for step-wise CoT evaluators."""
+
+    def test_stepwise_rouge_recall_basic(self):
+        evaluator = StepWiseROUGERecall(mode="rougeL")
+        assert evaluator.name == "stepwise_rougeL_recall"
+        scores = evaluator.evaluate(
+            ["The sky is blue. Grass is green."],
+            ["Grass is green. The sky is blue."],
+        )
+        assert len(scores) == 1
+        assert 0.0 <= scores[0] <= 1.0
+
+    def test_stepwise_rouge_recall_reordered_vs_full(self):
+        """Step-wise should score higher than full-sequence when steps are reordered."""
+        gold = ["First step. Second step. Third step."]
+        reordered = ["Third step. First step. Second step."]
+        stepwise = StepWiseROUGERecall(mode="rougeL")
+        fullseq = ROUGERecall(mode="rougeL")
+        sw_score = stepwise.evaluate(gold, reordered)[0]
+        fs_score = fullseq.evaluate(gold, reordered)[0]
+        assert sw_score >= fs_score
+
+    def test_stepwise_rouge_recall_empty_gold(self):
+        evaluator = StepWiseROUGERecall(mode="rougeL")
+        scores = evaluator.evaluate([""], ["Some generated text."])
+        assert scores[0] == 0.0
+
+    def test_stepwise_rouge_recall_empty_generated(self):
+        evaluator = StepWiseROUGERecall(mode="rougeL")
+        scores = evaluator.evaluate(["Some gold text."], [""])
+        assert scores[0] == 0.0
+
+    def test_stepwise_cosine_similarity_basic(self):
+        evaluator = StepWiseCosineSimilarity()
+        assert evaluator.name == "stepwise_cosine_similarity"
+        scores = evaluator.evaluate(
+            ["The sky is blue. Grass is green."],
+            ["Grass is green. The sky is blue."],
+        )
+        assert len(scores) == 1
+        assert 0.0 <= scores[0] <= 1.0
+
+    def test_stepwise_cosine_similarity_reordered_vs_full(self):
+        """Step-wise should score higher than full-sequence when steps are reordered."""
+        gold = ["Paris is in France. Tokyo is in Japan. Berlin is in Germany."]
+        reordered = ["Berlin is in Germany. Paris is in France. Tokyo is in Japan."]
+        stepwise = StepWiseCosineSimilarity()
+        fullseq = CosineSimilarity()
+        sw_score = stepwise.evaluate(gold, reordered)[0]
+        fs_score = fullseq.evaluate(gold, reordered)[0]
+        assert sw_score >= fs_score
+
+    def test_stepwise_cosine_similarity_empty(self):
+        evaluator = StepWiseCosineSimilarity()
+        assert evaluator.evaluate([""], ["Some text."])[0] == 0.0
+        assert evaluator.evaluate(["Some text."], [""])[0] == 0.0
+
+    def test_stepwise_evaluators_multiple_examples(self):
+        """Both evaluators handle multiple examples in a single call."""
+        rouge_eval = StepWiseROUGERecall(mode="rougeL")
+        cosine_eval = StepWiseCosineSimilarity()
+        gold = ["Sentence one. Sentence two.", "Another fact. More info."]
+        gen = ["Sentence two. Sentence one.", "More info. Another fact."]
+        rouge_scores = rouge_eval.evaluate(gold, gen)
+        cosine_scores = cosine_eval.evaluate(gold, gen)
+        assert len(rouge_scores) == 2
+        assert len(cosine_scores) == 2
+        assert all(0.0 <= s <= 1.0 for s in rouge_scores)
+        assert all(0.0 <= s <= 1.0 for s in cosine_scores)
