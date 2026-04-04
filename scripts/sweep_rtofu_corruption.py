@@ -17,11 +17,11 @@ import os
 from scipy.stats import hmean
 from transformers import GenerationConfig
 
-from eco.attack import AttackedReasoningModel, PromptClassifier
+from eco.attack import AttackedModel, PromptClassifier
 from eco.dataset.rtofu import RTOFU
 from eco.evaluator import CosineSimilarity, EntailmentScore, ROUGERecall, TokenEntropy
 from eco.inference import ReasoningGenerationEngine
-from eco.model import HFModel
+from eco.model import HFModel, ReasoningModel
 from eco.optimizer import ZerothOrderOptimizerScalar
 from eco.utils import seed_everything
 
@@ -155,15 +155,16 @@ def evaluate_config(attacked_model):
     return compute_afe_cfe(summary)
 
 
-def make_attacked_model(corrupt_method, corrupt_args):
-    return AttackedReasoningModel(
+def make_model(corrupt_method, corrupt_args):
+    """Create a ReasoningModel wrapping an AttackedModel for the given config."""
+    return ReasoningModel(AttackedModel(
         model=base_model,
         prompt_classifier=prompt_classifier,
         token_classifier=None,
         corrupt_method=corrupt_method,
         corrupt_args=corrupt_args,
         classifier_threshold=0.99,
-    )
+    ))
 
 
 def result_path(method, dims=None, strength=None):
@@ -190,7 +191,7 @@ def save_result(path, afe, cfe, all_results, extra=None):
 
 
 def zoo_score(strength, model, dims):
-    model.update_corrupt_args({"dims": dims, "strength": strength})
+    model._inner.update_corrupt_args({"dims": dims, "strength": strength})
     afe, cfe, _ = evaluate_config(model)
     combined = float(hmean([afe, cfe])) if afe > 0 and cfe > 0 else 0.0
     print(f"    strength={strength:.4f} -> AFE={afe:.4f}, CFE={cfe:.4f}, combined={combined:.4f}")
@@ -215,7 +216,7 @@ for method in args.methods:
         if os.path.exists(path):
             print(f"  SKIP (exists): {path}")
             continue
-        attacked = make_attacked_model(method, {})
+        attacked = make_model(method, {})
         afe, cfe, results = evaluate_config(attacked)
         save_result(path, afe, cfe, results)
         all_sweep_results.append({"method": method, "AFE": afe, "CFE": cfe})
@@ -228,7 +229,7 @@ for method in args.methods:
                 print(f"  SKIP (exists): {path}")
                 continue
             print(f"\n  dims={dims}")
-            attacked = make_attacked_model(method, {"dims": dims})
+            attacked = make_model(method, {"dims": dims})
             afe, cfe, results = evaluate_config(attacked)
             save_result(path, afe, cfe, results)
             all_sweep_results.append({"method": method, "dims": dims, "AFE": afe, "CFE": cfe})
@@ -245,7 +246,7 @@ for method in args.methods:
                 min_beta=args.min_strength,
             )
             best_combined, best_strength = 0.0, args.initial_strength
-            attacked = make_attacked_model(method, {"dims": dims, "strength": args.initial_strength})
+            attacked = make_model(method, {"dims": dims, "strength": args.initial_strength})
 
             for step in range(args.zoo_steps):
                 output = optimizer.step(
@@ -260,7 +261,7 @@ for method in args.methods:
 
             # Final evaluation at best strength
             print(f"  Best strength={best_strength:.4f}, evaluating...")
-            attacked.update_corrupt_args({"dims": dims, "strength": best_strength})
+            attacked._inner.update_corrupt_args({"dims": dims, "strength": best_strength})
             afe, cfe, results = evaluate_config(attacked)
             path = result_path(method, dims=dims, strength=round(best_strength, 4))
             save_result(path, afe, cfe, results, extra={"optimized_strength": best_strength})

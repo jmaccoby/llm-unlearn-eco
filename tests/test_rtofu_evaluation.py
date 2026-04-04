@@ -19,6 +19,7 @@ from eco.evaluator import (
     TokenEntropy,
 )
 from eco.inference import ReasoningGenerationEngine
+from eco.model.reasoning import ReasoningModel
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +150,7 @@ class TestRTOFUDataset:
 class TestReasoningGenerationEngine:
     def setup_method(self):
         self.tokenizer = _make_tokenizer()
-        self.model = DummyModel(self.tokenizer)
+        self.model = ReasoningModel(DummyModel(self.tokenizer))
         self.rtofu = _make_rtofu(self.tokenizer)
         # Limit dataset to a few examples for speed
         for split in ["forget10", "retain90"]:
@@ -343,6 +344,10 @@ class TestStepWiseEvaluators:
         fullseq = ROUGERecall(mode="rougeL")
         sw_score = stepwise.evaluate(gold, reordered)[0]
         fs_score = fullseq.evaluate(gold, reordered)[0]
+        # Step-wise best-match alignment is invariant to step order by design;
+        # full-sequence ROUGE-L is position-sensitive so it scores lower on
+        # reordered inputs. This is a behavioral expectation for these specific
+        # fixtures, not a mathematical guarantee for arbitrary inputs.
         assert sw_score >= fs_score
 
     def test_stepwise_rouge_recall_empty_gold(self):
@@ -373,6 +378,10 @@ class TestStepWiseEvaluators:
         fullseq = CosineSimilarity()
         sw_score = stepwise.evaluate(gold, reordered)[0]
         fs_score = fullseq.evaluate(gold, reordered)[0]
+        # Step-wise best-match compares each gold sentence to the most similar
+        # generated sentence, so reordering doesn't hurt it. Full-sequence
+        # cosine similarity encodes the whole string, which can vary with order.
+        # This holds for these particular fixtures but is not a hard guarantee.
         assert sw_score >= fs_score
 
     def test_stepwise_cosine_similarity_empty(self):

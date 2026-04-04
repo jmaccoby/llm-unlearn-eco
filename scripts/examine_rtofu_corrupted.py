@@ -13,10 +13,9 @@ import csv
 import torch
 from transformers import GenerationConfig
 
-from eco.attack import AttackedReasoningModel, PromptClassifier
-from eco.attack.utils import remove_hooks
+from eco.attack import AttackedModel, PromptClassifier
 from eco.dataset.rtofu import RTOFU
-from eco.model import HFModel
+from eco.model import HFModel, ReasoningModel
 from eco.utils import fix_bpe
 
 
@@ -71,14 +70,14 @@ corrupt_args = {"dims": args.dims}
 if args.strength is not None:
     corrupt_args["strength"] = args.strength
 
-attacked_model = AttackedReasoningModel(
+attacked_model = ReasoningModel(AttackedModel(
     model=model,
     prompt_classifier=prompt_classifier,
     token_classifier=None,
     corrupt_method=args.corrupt_method,
     corrupt_args=corrupt_args,
     classifier_threshold=args.classifier_threshold,
-)
+))
 
 # Load dataset
 print(f"Loading R-TOFU split: {args.split}")
@@ -101,19 +100,19 @@ for i, example in enumerate(examples):
     gold_answer = example["answer"]
     cot = example.get("cot", "")
 
-    # Generate response with corruption (think prefix appended automatically)
+    # Generate response with corruption (think prefix appended by ReasoningModel)
     inputs = tokenizer(question, return_tensors="pt").to(device)
-    prompt_len = inputs["input_ids"].shape[1]
+    decode_start = inputs["input_ids"].shape[1] + attacked_model.n_think_tokens
     with torch.no_grad():
         output_ids = attacked_model.generate(
             [question],
             **inputs,
             generation_config=attacked_model.generation_config,
         )
-    remove_hooks(attacked_model.model)
+    attacked_model._inner.remove_hooks()
 
-    # Slice after the original question (keeping the <think> prefix in output)
-    raw = tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=True)
+    # Slice after question + think prefix to get only generated content
+    raw = tokenizer.decode(output_ids[0][decode_start:], skip_special_tokens=True)
     raw = fix_bpe(raw)
     think_block, response = raw.split("</think>\n\n", 1) if "</think>\n\n" in raw else (raw, "")
 
@@ -123,7 +122,7 @@ for i, example in enumerate(examples):
     print(f"GOLD ANSWER:\n{gold_answer}\n")
     if args.show_cot:
         if think_block:
-            print(f"MODEL THINKING:\n{think_block.removeprefix('<think>').strip()}\n")
+            print(f"MODEL THINKING:\n{think_block.strip()}\n")
         if cot:
             print(f"GOLD COT:\n{cot}\n")
     print(f"MODEL RESPONSE:\n{response}\n")

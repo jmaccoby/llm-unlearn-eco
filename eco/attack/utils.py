@@ -10,7 +10,20 @@ def apply_corruption_hook(module, corrupt_method, corrupt_args):
 
     def corrupt(module, inputs, outputs):
         if outputs.shape[1] > 1:
-            outputs = corrupt_fn(outputs, **corrupt_args)
+            # Fit the position mask to the actual sequence length.  The
+            # mask may be longer (prompt truncated at tokenization time) or
+            # shorter (e.g. think-prefix tokens appended after corruption
+            # setup).  Truncate long masks and zero-pad short ones so the
+            # mask always matches outputs.shape[1].
+            seq_len = outputs.shape[1]
+            safe_args = corrupt_args.copy()
+            if "pos" in safe_args:
+                safe_args["pos"] = [
+                    row[:seq_len] if len(row) >= seq_len
+                    else row + [0] * (seq_len - len(row))
+                    for row in safe_args["pos"]
+                ]
+            outputs = corrupt_fn(outputs, **safe_args)
         return outputs
 
     handle = module.register_forward_hook(corrupt)
@@ -73,7 +86,8 @@ def match_labeled_tokens(src_labels, src_offsets, tgt_offsets):
 
 def remove_hooks(model):
     for module in model.modules():
-        module._forward_hooks = OrderedDict()
+        for handle_id in list(module._forward_hooks):
+            module._forward_hooks.pop(handle_id)
 
 
 def print_hooks(model):

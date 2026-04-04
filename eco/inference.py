@@ -1,12 +1,24 @@
 import time
 
 import numpy as np
-import torch
 from tqdm import tqdm
 
-from eco.attack.model import AttackedReasoningModel
+from eco.attack.model import AttackedModel
 from eco.attack.utils import remove_hooks
 from eco.utils import fix_bpe
+
+
+def _remove_hooks(model):
+    """Remove hooks using the model's handle-based method if available, else fallback."""
+    # Unwrap ReasoningModel to reach the AttackedModel or HFModel inside.
+    from eco.model.reasoning import ReasoningModel
+    inner = model._inner if isinstance(model, ReasoningModel) else model
+    if isinstance(inner, AttackedModel):
+        inner.remove_hooks()
+    elif hasattr(inner, "model"):
+        remove_hooks(inner.model)
+    else:
+        remove_hooks(inner)
 
 
 class InferenceEngine:
@@ -95,7 +107,7 @@ class EvaluationEngine(InferenceEngine):
                 desc=f"Evaluating {self.evaluator.name} of {self.data_module.name} on {subset_name}",
                 total=len(dataset),
             ):
-                remove_hooks(self.model.model)
+                _remove_hooks(self.model)
                 prompts = batch[self.data_module.eval_prompt_key]
                 answers = batch[self.data_module.eval_answer_key]
 
@@ -112,7 +124,7 @@ class EvaluationEngine(InferenceEngine):
                         correct_answer = batch["correct_answer"]
                         outputs = [{"correct": correct_answer, "predicted": outputs}]
                 all_outputs.extend(outputs)
-                remove_hooks(self.model.model)
+                _remove_hooks(self.model)
             self.results.append(
                 {
                     f"{self.data_module.name}_{subset_name}_{self.evaluator.name}": all_outputs
@@ -206,7 +218,7 @@ class GenerationEngine(InferenceEngine):
                 desc=f"Generating completions of {self.data_module.name} on {subset_name}",
                 total=len(dataset),
             ):
-                remove_hooks(self.model.model)
+                _remove_hooks(self.model)
                 prompts = batch[self.data_module.gen_prompt_key]
                 gold_answers = batch[self.data_module.gen_answer_key]
 
@@ -250,7 +262,7 @@ class GenerationEngine(InferenceEngine):
                 all_gold_answers.append(gold_answers)
                 all_generated_answers.append(generated_answers_truncated)
                 all_prompts.append(prompts)
-                remove_hooks(self.model.model)
+                _remove_hooks(self.model)
 
             assert (
                 len(all_gold_answers) == len(all_generated_answers) == len(all_prompts)
@@ -301,7 +313,6 @@ class ReasoningGenerationEngine(GenerationEngine):
     ``{dataset_name}_{subset_name}``.
     """
 
-    THINK_PREFIX = "<think>\n"
     THINK_SUFFIX = "</think>\n\n"
 
     def __init__(
@@ -316,8 +327,6 @@ class ReasoningGenerationEngine(GenerationEngine):
         prompt_prefix="",
         comparison_length=128,
         truncate_answers=False,
-        max_retries=3,
-        retry_token_multiplier=2,
     ):
         super().__init__(
             model,
@@ -333,56 +342,6 @@ class ReasoningGenerationEngine(GenerationEngine):
         self.cot_evaluator = cot_evaluator or []
         if not isinstance(self.cot_evaluator, list):
             self.cot_evaluator = [self.cot_evaluator]
-        self.max_retries = max_retries
-        self.retry_token_multiplier = retry_token_multiplier
-
-    def _generate_single(self, prompt, max_new_tokens):
-        """Generate a single response with a specific token limit."""
-        model_handles_think = isinstance(self.model, AttackedReasoningModel)
-
-        tokenized = self.tokenizer(
-            prompt, return_tensors="pt", truncation=True, max_length=256
-        ).to(self.model.device)
-        prompt_len = tokenized["input_ids"].shape[1]
-
-        if not model_handles_think:
-            think_ids = self.tokenizer(
-                self.THINK_PREFIX, add_special_tokens=False, return_tensors="pt"
-            )["input_ids"].to(self.model.device)
-            tokenized["input_ids"] = torch.cat(
-                [tokenized["input_ids"], think_ids], dim=1
-            )
-            tokenized["attention_mask"] = torch.cat(
-                [tokenized["attention_mask"], torch.ones_like(think_ids)], dim=1
-            )
-
-        from copy import deepcopy
-        gen_config = deepcopy(self.model.generation_config)
-        gen_config.max_new_tokens = max_new_tokens
-
-        generated = self.model.generate(
-            **tokenized,
-            prompts=[prompt],
-            generation_config=gen_config,
-            eos_token_id=self.tokenizer.eos_token_id,
-            pad_token_id=self.tokenizer.pad_token_id,
-        )
-        remove_hooks(self.model.model)
-
-        raw = self.tokenizer.decode(generated[0][prompt_len:], skip_special_tokens=True)
-        return fix_bpe(raw)
-
-    def _retry_generation(self, prompt, original_response, base_max_tokens):
-        """Retry generation with increasing token limits for empty answers."""
-        max_tokens = base_max_tokens
-        for attempt in range(self.max_retries):
-            max_tokens = int(max_tokens * self.retry_token_multiplier)
-            resp = self._generate_single(prompt, max_tokens)
-            if self.THINK_SUFFIX in resp:
-                cot, answer = resp.split(self.THINK_SUFFIX, 1)
-                return cot, answer
-        # All retries exhausted — treat full response as CoT
-        return original_response, ""
 
     def _generate(self):
         self.prepare_dataset()
@@ -390,8 +349,7 @@ class ReasoningGenerationEngine(GenerationEngine):
         if self.tokenizer.padding_side != "left":
             self.tokenizer.padding_side = "left"
 
-        # AttackedReasoningModel already appends the think prefix
-        model_handles_think = isinstance(self.model, AttackedReasoningModel)
+        n_think = getattr(self.model, "n_think_tokens", 0)
 
         subsets_generations = {}
         for subset_name, dataset in self.datasets.items():
@@ -405,7 +363,7 @@ class ReasoningGenerationEngine(GenerationEngine):
                 desc=f"Generating completions of {self.data_module.name} on {subset_name}",
                 total=len(dataset),
             ):
-                remove_hooks(self.model.model)
+                _remove_hooks(self.model)
                 prompts = batch[self.data_module.gen_prompt_key]
                 gold_answers = batch[self.data_module.gen_answer_key]
 
@@ -416,23 +374,11 @@ class ReasoningGenerationEngine(GenerationEngine):
                     truncation=True,
                     max_length=256,
                 ).to(self.model.device)
-                prompt_len = tokenized_prompts["input_ids"].shape[1]
 
-                if not model_handles_think:
-                    think_ids = self.tokenizer(
-                        self.THINK_PREFIX,
-                        add_special_tokens=False,
-                        return_tensors="pt",
-                    )["input_ids"].to(self.model.device)
-                    batch_size = tokenized_prompts["input_ids"].shape[0]
-                    tokenized_prompts["input_ids"] = torch.cat(
-                        [tokenized_prompts["input_ids"], think_ids.expand(batch_size, -1)],
-                        dim=1,
-                    )
-                    tokenized_prompts["attention_mask"] = torch.cat(
-                        [tokenized_prompts["attention_mask"], torch.ones_like(think_ids).expand(batch_size, -1)],
-                        dim=1,
-                    )
+                # The model (ReasoningModel) appends think tokens in generate(),
+                # so decode_start accounts for both the tokenized prompt and
+                # the think prefix that will be prepended.
+                decode_start = tokenized_prompts["input_ids"].shape[1] + n_think
 
                 start_time = time.perf_counter()
                 generated = self.model.generate(
@@ -446,17 +392,18 @@ class ReasoningGenerationEngine(GenerationEngine):
                 total_time += end_time - start_time
                 total_examples += len(prompts)
 
-                # Decode only new tokens (after original prompt), apply BPE fix
+                # Decode only new tokens (after prompt + think prefix), apply BPE fix
                 batch_responses = []
                 for i in range(generated.shape[0]):
                     raw = self.tokenizer.decode(
-                        generated[i][prompt_len:], skip_special_tokens=True
+                        generated[i][decode_start:], skip_special_tokens=True
                     )
                     batch_responses.append(fix_bpe(raw))
 
                 # Split into CoT and answer at </think>\n\n
-                # If delimiter is missing (e.g. truncated by max_new_tokens),
-                # retry with more tokens before falling back to empty answer.
+                # If delimiter is missing (e.g. truncated by max_new_tokens
+                # or incoherent output from corruption), treat the full
+                # response as CoT with an empty answer.
                 batch_cot, batch_answer = [], []
                 for idx, resp in enumerate(batch_responses):
                     if self.THINK_SUFFIX in resp:
@@ -464,13 +411,8 @@ class ReasoningGenerationEngine(GenerationEngine):
                         batch_cot.append(cot)
                         batch_answer.append(answer)
                     else:
-                        cot, answer = self._retry_generation(
-                            prompts[idx], resp, self.model.generation_config.max_new_tokens
-                        )
-                        batch_cot.append(cot)
-                        batch_answer.append(answer)
-                        if answer:
-                            batch_responses[idx] = cot + self.THINK_SUFFIX + answer
+                        batch_cot.append(resp)
+                        batch_answer.append("")
 
                 # Gold answers are plain text from the dataset — no special
                 # tokens to strip.  Skipping the tokenize/decode roundtrip
@@ -485,7 +427,7 @@ class ReasoningGenerationEngine(GenerationEngine):
                 all_generated_cot.append(batch_cot)
                 all_generated_answer.append(batch_answer)
                 all_prompts.append(prompts)
-                remove_hooks(self.model.model)
+                _remove_hooks(self.model)
 
             subsets_generations[subset_name] = {
                 "prompt": all_prompts,

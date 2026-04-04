@@ -13,6 +13,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 from eco.dataset.rtofu import RTOFU
+from eco.model.reasoning import ReasoningModel
 from eco.utils import fix_bpe
 
 MODEL_PATH = "sangyon/LRM-target"
@@ -51,6 +52,9 @@ model.generation_config = GenerationConfig(
     eos_token_id=tokenizer.eos_token_id,
 )
 model.eval()
+# Attach tokenizer so ReasoningModel can access it
+model.tokenizer = tokenizer
+model = ReasoningModel(model)
 
 # Load dataset
 print(f"Loading R-TOFU split: {args.split}")
@@ -71,14 +75,14 @@ for i, example in enumerate(examples):
     gold_answer = example["answer"]
     cot = example.get("cot", "")
 
-    # Generate response, forcing the model to begin with a reasoning block
-    prompt_len = len(tokenizer.encode(question))
-    inputs = tokenizer(question + "<think>\n", return_tensors="pt").to(device)
+    # Generate response (ReasoningModel appends <think>\n automatically)
+    inputs = tokenizer(question, return_tensors="pt").to(device)
+    decode_start = inputs["input_ids"].shape[1] + model.n_think_tokens
     with torch.no_grad():
         output_ids = model.generate(**inputs, generation_config=model.generation_config)
-    # Slice to new tokens only (after the original question, keeping the <think> prefix),
+    # Slice to new tokens only (after question + think prefix),
     # then apply inverse BPE byte mapping to resolve Ġ/Ċ characters
-    raw = tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=True)
+    raw = tokenizer.decode(output_ids[0][decode_start:], skip_special_tokens=True)
     raw = fix_bpe(raw)
     # Extract final answer after the reasoning block
     think_block, response = raw.split("</think>\n\n", 1) if "</think>\n\n" in raw else (raw, "")
@@ -89,7 +93,7 @@ for i, example in enumerate(examples):
     print(f"GOLD ANSWER:\n{gold_answer}\n")
     if args.show_cot:
         if think_block:
-            print(f"MODEL THINKING:\n{think_block.removeprefix('<think>').strip()}\n")
+            print(f"MODEL THINKING:\n{think_block.strip()}\n")
         if cot:
             print(f"GOLD COT:\n{cot}\n")
     print(f"MODEL RESPONSE:\n{response}\n")

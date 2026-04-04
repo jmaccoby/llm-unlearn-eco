@@ -24,6 +24,7 @@ def rand_noise_first_n(data, pos, dims, strength):
     return data
 
 
+@torch.no_grad()
 def rand_noise_rand_n(data, pos, dims, strength):
     pos_mask = torch.tensor(pos, dtype=torch.bool, device=data.device)
     if not pos_mask.any():

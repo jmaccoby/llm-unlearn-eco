@@ -13,7 +13,7 @@ import os
 from scipy.stats import hmean
 from transformers import GenerationConfig
 
-from eco.attack import AttackedReasoningModel, PromptClassifier
+from eco.attack import AttackedModel, PromptClassifier
 from eco.dataset.rtofu import RTOFU
 from eco.evaluator import (
     CosineSimilarity,
@@ -24,7 +24,7 @@ from eco.evaluator import (
     TokenEntropy,
 )
 from eco.inference import ReasoningGenerationEngine
-from eco.model import HFModel
+from eco.model import HFModel, ReasoningModel
 from eco.utils import seed_everything
 
 parser = argparse.ArgumentParser()
@@ -38,7 +38,7 @@ parser.add_argument(
 parser.add_argument("--model_name", type=str, default="LRM-target")
 parser.add_argument("--num_examples", type=int, default=0, help="Number of examples per subset to evaluate (0 = all)")
 parser.add_argument("--batch_size", type=int, default=8)
-parser.add_argument("--max_new_tokens", type=int, default=512)
+parser.add_argument("--max_new_tokens", type=int, default=1024)
 parser.add_argument("--classifier_threshold", type=float, default=0.99)
 parser.add_argument("--corrupt_method", type=str, default=None)
 parser.add_argument("--dims", type=int, default=None)
@@ -78,7 +78,7 @@ if args.corrupt_method is not None:
     corrupt_args = {"dims": args.dims}
     if args.strength is not None:
         corrupt_args["strength"] = args.strength
-    model = AttackedReasoningModel(
+    model = AttackedModel(
         model=model,
         prompt_classifier=prompt_classifier,
         token_classifier=None,
@@ -86,6 +86,8 @@ if args.corrupt_method is not None:
         corrupt_args=corrupt_args,
         classifier_threshold=args.classifier_threshold,
     )
+
+model = ReasoningModel(model)
 
 # Load dataset
 model_config = model.model_config
@@ -148,8 +150,11 @@ for metric in afe_metrics:
     if key in all_results:
         afe_forget_scores.append(1.0 - all_results[key])
 
-if afe_forget_scores and all(s > 0 for s in afe_forget_scores):
-    all_results["AFE"] = float(hmean(afe_forget_scores))
+if afe_forget_scores:
+    if all(s > 0 for s in afe_forget_scores):
+        all_results["AFE"] = float(hmean(afe_forget_scores))
+    else:
+        all_results["AFE"] = 0.0
     print(f"AFE: {all_results['AFE']:.4f}")
 
 # CFE = hmean(1 - forget_cot_rouge, 1 - forget_cot_cosine)
@@ -160,8 +165,11 @@ for metric in cfe_metrics:
     if key in all_results:
         cfe_forget_scores.append(1.0 - all_results[key])
 
-if cfe_forget_scores and all(s > 0 for s in cfe_forget_scores):
-    all_results["CFE"] = float(hmean(cfe_forget_scores))
+if cfe_forget_scores:
+    if all(s > 0 for s in cfe_forget_scores):
+        all_results["CFE"] = float(hmean(cfe_forget_scores))
+    else:
+        all_results["CFE"] = 0.0
     print(f"CFE: {all_results['CFE']:.4f}")
 
 # Save results
