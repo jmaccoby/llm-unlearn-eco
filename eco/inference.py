@@ -475,6 +475,27 @@ class ReasoningGenerationEngine(GenerationEngine):
                     {f"{self.data_module.name}_{subset_name}_{evaluator.name}": evaluator_outputs}
                 )
 
+            # Override answer evaluator scores for empty-answer samples.
+            # When </think> is missing, generated_answer is "". Evaluators
+            # score empty-vs-gold as ~0.0, which yields 1-0=1.0 AFE —
+            # rewarding garbage. Setting the raw score to 1.0 makes
+            # 1-1.0=0.0, contributing AFE=0 for those samples.
+            empty_mask = [ans == "" for ans in data_answer]
+            if any(empty_mask):
+                for result_dict in self.results:
+                    result_key = list(result_dict.keys())[0]
+                    if result_key.startswith(key + "_") and "_cot_" not in result_key:
+                        scores = result_dict[result_key]
+                        for i, is_empty in enumerate(empty_mask):
+                            if is_empty:
+                                scores[i] = 1.0
+
+            # Track think-completion rate for AFE penalty multiplier.
+            n_total = len(data_answer)
+            n_complete = sum(1 for ans in data_answer if ans != "")
+            think_rate = n_complete / n_total if n_total > 0 else 0.0
+            self.results.append({f"{key}_think_completion_rate": [think_rate]})
+
             # Run CoT evaluators (CFE)
             for evaluator in self.cot_evaluator:
                 evaluator_outputs = []

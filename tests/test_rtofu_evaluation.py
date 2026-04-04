@@ -20,6 +20,7 @@ from eco.evaluator import (
 )
 from eco.inference import ReasoningGenerationEngine
 from eco.model.reasoning import ReasoningModel
+from eco.utils import compute_afe
 
 
 # ---------------------------------------------------------------------------
@@ -401,3 +402,204 @@ class TestStepWiseEvaluators:
         assert len(cosine_scores) == 2
         assert all(0.0 <= s <= 1.0 for s in rouge_scores)
         assert all(0.0 <= s <= 1.0 for s in cosine_scores)
+
+
+# ---------------------------------------------------------------------------
+# DummyModel variant that omits </think> (simulates degenerate corruption)
+# ---------------------------------------------------------------------------
+
+class DummyModelNoThink(DummyModel):
+    """Like DummyModel but never produces </think>, simulating high corruption."""
+
+    def generate(self, *args, **kwargs):
+        kwargs.pop("prompts", None)
+        kwargs.pop("generation_config", None)
+        kwargs.pop("eos_token_id", None)
+        kwargs.pop("pad_token_id", None)
+
+        input_ids = kwargs.get("input_ids", args[0] if args else None)
+        batch_size = input_ids.shape[0]
+
+        results = []
+        for i in range(batch_size):
+            prompt_ids = input_ids[i]
+            # No </think> delimiter — answer will be ""
+            canned_response = "I ramble about nothing coherent at all."
+            response_ids = self.tokenizer.encode(canned_response, add_special_tokens=False)
+            full_ids = prompt_ids.tolist() + response_ids
+            results.append(full_ids)
+
+        max_len = max(len(r) for r in results)
+        padded = [r + [self.tokenizer.pad_token_id] * (max_len - len(r)) for r in results]
+        return torch.tensor(padded)
+
+
+class DummyModelMixed(DummyModel):
+    """Produces </think> for even-indexed samples, omits it for odd-indexed."""
+
+    def __init__(self, tokenizer):
+        super().__init__(tokenizer)
+        self._call_count = 0
+
+    def generate(self, *args, **kwargs):
+        kwargs.pop("prompts", None)
+        kwargs.pop("generation_config", None)
+        kwargs.pop("eos_token_id", None)
+        kwargs.pop("pad_token_id", None)
+
+        input_ids = kwargs.get("input_ids", args[0] if args else None)
+        batch_size = input_ids.shape[0]
+
+        results = []
+        for i in range(batch_size):
+            prompt_ids = input_ids[i]
+            idx = self._call_count
+            self._call_count += 1
+            if idx % 2 == 0:
+                canned_response = f"I considered the question.{THINK_SUFFIX}Dummy answer."
+            else:
+                canned_response = "I ramble about nothing coherent at all."
+            response_ids = self.tokenizer.encode(canned_response, add_special_tokens=False)
+            full_ids = prompt_ids.tolist() + response_ids
+            results.append(full_ids)
+
+        max_len = max(len(r) for r in results)
+        padded = [r + [self.tokenizer.pad_token_id] * (max_len - len(r)) for r in results]
+        return torch.tensor(padded)
+
+
+class TestEmptyAnswerHandling:
+    """Tests for per-sample AFE=0 override and think_completion_rate."""
+
+    def setup_method(self):
+        self.tokenizer = _make_tokenizer()
+        self.rtofu = _make_rtofu(self.tokenizer)
+        for split in ["forget10", "retain90"]:
+            self.rtofu.dataset[split] = self.rtofu.dataset[split].select(range(4))
+
+    def test_all_empty_answers_scores_overridden(self):
+        """When all answers are empty, answer evaluator scores should be 1.0."""
+        model = ReasoningModel(DummyModelNoThink(self.tokenizer))
+        engine = ReasoningGenerationEngine(
+            model=model,
+            tokenizer=self.tokenizer,
+            data_module=self.rtofu,
+            subset_names=["forget10"],
+            answer_evaluator=[ROUGERecall(mode="rougeL")],
+            batch_size=4,
+        )
+        engine.inference()
+        _, outputs = engine.summary()
+
+        for result_dict in outputs:
+            key = list(result_dict.keys())[0]
+            if "rougeL_recall" in key and "_cot_" not in key:
+                scores = result_dict[key]
+                assert all(s == 1.0 for s in scores), (
+                    f"Empty-answer samples should have score overridden to 1.0, got {scores}"
+                )
+
+    def test_all_empty_think_completion_rate_zero(self):
+        """think_completion_rate should be 0.0 when no responses have </think>."""
+        model = ReasoningModel(DummyModelNoThink(self.tokenizer))
+        engine = ReasoningGenerationEngine(
+            model=model,
+            tokenizer=self.tokenizer,
+            data_module=self.rtofu,
+            subset_names=["forget10"],
+            answer_evaluator=[ROUGERecall(mode="rougeL")],
+            batch_size=4,
+        )
+        engine.inference()
+        summary, _ = engine.summary()
+
+        all_results = {}
+        for r in summary:
+            all_results.update(r)
+        assert "rtofu_forget10_think_completion_rate" in all_results
+        assert all_results["rtofu_forget10_think_completion_rate"] == 0.0
+
+    def test_all_empty_afe_is_zero(self):
+        """AFE should be 0.0 when all answers are empty (via both mechanisms)."""
+        model = ReasoningModel(DummyModelNoThink(self.tokenizer))
+        engine = ReasoningGenerationEngine(
+            model=model,
+            tokenizer=self.tokenizer,
+            data_module=self.rtofu,
+            subset_names=["forget10"],
+            answer_evaluator=[
+                ROUGERecall(mode="rougeL"),
+                CosineSimilarity(),
+                EntailmentScore(reverse=False),
+            ],
+            batch_size=4,
+        )
+        engine.inference()
+        summary, _ = engine.summary()
+
+        all_results = {}
+        for r in summary:
+            all_results.update(r)
+        afe = compute_afe(all_results, "rtofu_forget10")
+        assert afe == 0.0
+
+    def test_mixed_answers_reduced_afe(self):
+        """AFE should be reduced when some answers are empty."""
+        model = ReasoningModel(DummyModelMixed(self.tokenizer))
+        engine = ReasoningGenerationEngine(
+            model=model,
+            tokenizer=self.tokenizer,
+            data_module=self.rtofu,
+            subset_names=["forget10"],
+            answer_evaluator=[ROUGERecall(mode="rougeL")],
+            batch_size=1,  # batch_size=1 so mixed model alternates per-sample
+        )
+        engine.inference()
+        summary, _ = engine.summary()
+
+        all_results = {}
+        for r in summary:
+            all_results.update(r)
+        rate = all_results["rtofu_forget10_think_completion_rate"]
+        assert 0.0 < rate < 1.0, f"Expected partial completion, got {rate}"
+
+    def test_normal_model_think_completion_rate_one(self):
+        """DummyModel (always produces </think>) should have rate=1.0."""
+        model = ReasoningModel(DummyModel(self.tokenizer))
+        engine = ReasoningGenerationEngine(
+            model=model,
+            tokenizer=self.tokenizer,
+            data_module=self.rtofu,
+            subset_names=["forget10"],
+            answer_evaluator=[ROUGERecall(mode="rougeL")],
+            batch_size=4,
+        )
+        engine.inference()
+        summary, _ = engine.summary()
+
+        all_results = {}
+        for r in summary:
+            all_results.update(r)
+        assert all_results["rtofu_forget10_think_completion_rate"] == 1.0
+
+    def test_compute_afe_without_rate_backward_compatible(self):
+        """compute_afe works without think_completion_rate (backward compat)."""
+        results = {
+            "p_rougeL_recall": 0.2,
+            "p_cosine_similarity": 0.3,
+            "p_entailment_score": 0.1,
+        }
+        afe = compute_afe(results, "p")
+        assert afe > 0.0  # Should compute normally without rate key
+
+    def test_compute_afe_with_rate_multiplier(self):
+        """compute_afe applies think_completion_rate as multiplier."""
+        results = {
+            "p_rougeL_recall": 0.0,
+            "p_cosine_similarity": 0.0,
+            "p_entailment_score": 0.0,
+            "p_think_completion_rate": 0.5,
+        }
+        afe = compute_afe(results, "p")
+        # All metrics are 0.0, so 1-metric = 1.0, hmean = 1.0, * 0.5 = 0.5
+        assert abs(afe - 0.5) < 1e-6
