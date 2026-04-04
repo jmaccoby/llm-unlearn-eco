@@ -19,11 +19,18 @@ from transformers import GenerationConfig
 
 from eco.attack import AttackedModel, PromptClassifier
 from eco.dataset.rtofu import RTOFU
-from eco.evaluator import CosineSimilarity, EntailmentScore, ROUGERecall, TokenEntropy
+from eco.evaluator import (
+    CosineSimilarity,
+    EntailmentScore,
+    ROUGERecall,
+    StepWiseCosineSimilarity,
+    StepWiseROUGERecall,
+    TokenEntropy,
+)
 from eco.inference import ReasoningGenerationEngine
 from eco.model import HFModel, ReasoningModel
 from eco.optimizer import ZerothOrderOptimizerScalar
-from eco.utils import seed_everything
+from eco.utils import compute_afe, compute_cfe, log_print, seed_everything
 
 # Methods that require dims + strength (optimized via ZOO)
 NOISE_METHODS = ["rand_noise_first_n", "rand_noise_top_k", "set_rand_noise_first_n"]
@@ -66,7 +73,7 @@ os.makedirs(args.output_dir, exist_ok=True)
 # Load model and dataset (shared across all configs)
 # ---------------------------------------------------------------------------
 
-print(f"Loading model: {args.model_name}")
+log_print(f"Loading model: {args.model_name}")
 generation_config = GenerationConfig(
     do_sample=False,
     max_new_tokens=args.max_new_tokens,
@@ -78,7 +85,7 @@ base_model = HFModel(
     generation_config=generation_config,
 )
 
-print(f"Loading prompt classifier: rtofu_classifiers/{args.split}")
+log_print(f"Loading prompt classifier: rtofu_classifiers/{args.split}")
 prompt_classifier = PromptClassifier(
     model_name="roberta-base",
     model_path=f"rtofu_classifiers/{args.split}",
@@ -103,39 +110,24 @@ answer_evaluators = [
     TokenEntropy(tokenizer=base_model.tokenizer),
 ]
 cot_evaluators = [
-    ROUGERecall(mode="rougeL"),
-    CosineSimilarity(),
-    EntailmentScore(reverse=False),
+    StepWiseROUGERecall(mode="rougeL"),
+    StepWiseCosineSimilarity(),
 ]
-
-AFE_METRICS = ["rougeL_recall", "cosine_similarity", "entailment_score"]
 
 # ---------------------------------------------------------------------------
 # Evaluation helpers
 # ---------------------------------------------------------------------------
 
 
-def compute_afe_cfe(summary):
+def extract_afe_cfe(summary):
     """Extract AFE and CFE from engine summary."""
     all_results = {}
     for r in summary:
         all_results.update(r)
 
     prefix = f"rtofu_{args.split}"
-    afe_scores = []
-    for metric in AFE_METRICS:
-        key = f"{prefix}_{metric}"
-        if key in all_results:
-            afe_scores.append(1.0 - all_results[key])
-
-    cfe_scores = []
-    for metric in AFE_METRICS:
-        key = f"{prefix}_cot_{metric}"
-        if key in all_results:
-            cfe_scores.append(1.0 - all_results[key])
-
-    afe = float(hmean(afe_scores)) if afe_scores and all(s > 0 for s in afe_scores) else 0.0
-    cfe = float(hmean(cfe_scores)) if cfe_scores and all(s > 0 for s in cfe_scores) else 0.0
+    afe = compute_afe(all_results, prefix)
+    cfe = compute_cfe(all_results, prefix)
     return afe, cfe, all_results
 
 
@@ -152,7 +144,7 @@ def evaluate_config(attacked_model):
     )
     engine.inference()
     summary, _ = engine.summary()
-    return compute_afe_cfe(summary)
+    return extract_afe_cfe(summary)
 
 
 def make_model(corrupt_method, corrupt_args):
@@ -182,7 +174,7 @@ def save_result(path, afe, cfe, all_results, extra=None):
         data.update(extra)
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
-    print(f"  Saved: {path}")
+    log_print(f"  Saved: {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +186,7 @@ def zoo_score(strength, model, dims):
     model._inner.update_corrupt_args({"dims": dims, "strength": strength})
     afe, cfe, _ = evaluate_config(model)
     combined = float(hmean([afe, cfe])) if afe > 0 and cfe > 0 else 0.0
-    print(f"    strength={strength:.4f} -> AFE={afe:.4f}, CFE={cfe:.4f}, combined={combined:.4f}")
+    log_print(f"    strength={strength:.4f} -> AFE={afe:.4f}, CFE={cfe:.4f}, combined={combined:.4f}")
     # Return negative combined score since ZOO does gradient descent (minimizes)
     return -combined
 
@@ -206,15 +198,15 @@ def zoo_score(strength, model, dims):
 all_sweep_results = []
 
 for method in args.methods:
-    print(f"\n{'='*60}")
-    print(f"METHOD: {method}")
-    print(f"{'='*60}")
+    log_print(f"\n{'='*60}")
+    log_print(f"METHOD: {method}")
+    log_print(f"{'='*60}")
 
     if method in PARAMFREE_METHODS:
         # Single evaluation, no parameters to tune
         path = result_path(method)
         if os.path.exists(path):
-            print(f"  SKIP (exists): {path}")
+            log_print(f"  SKIP (exists): {path}")
             continue
         attacked = make_model(method, {})
         afe, cfe, results = evaluate_config(attacked)
@@ -226,9 +218,9 @@ for method in args.methods:
         for dims in args.structural_dims_list:
             path = result_path(method, dims=dims)
             if os.path.exists(path):
-                print(f"  SKIP (exists): {path}")
+                log_print(f"  SKIP (exists): {path}")
                 continue
-            print(f"\n  dims={dims}")
+            log_print(f"\n  dims={dims}")
             attacked = make_model(method, {"dims": dims})
             afe, cfe, results = evaluate_config(attacked)
             save_result(path, afe, cfe, results)
@@ -237,7 +229,7 @@ for method in args.methods:
     elif method in NOISE_METHODS + VALUE_METHODS:
         # For each dims value, use ZOO to optimize strength
         for dims in args.dims_list:
-            print(f"\n  dims={dims}, optimizing strength via ZOO ({args.zoo_steps} steps)...")
+            log_print(f"\n  dims={dims}, optimizing strength via ZOO ({args.zoo_steps} steps)...")
             eps = args.initial_strength * 0.5
             optimizer = ZerothOrderOptimizerScalar(
                 lr=args.zoo_lr,
@@ -254,13 +246,13 @@ for method in args.methods:
                     {"model": attacked, "dims": dims},
                 )
                 current_combined = -output["f_score"]  # We negated combined in score fn
-                print(f"  step {step}: beta={output['beta']:.4f}, combined={current_combined:.4f}")
+                log_print(f"  step {step}: beta={output['beta']:.4f}, combined={current_combined:.4f}")
                 if current_combined > best_combined:
                     best_combined = current_combined
                     best_strength = output["beta"]
 
             # Final evaluation at best strength
-            print(f"  Best strength={best_strength:.4f}, evaluating...")
+            log_print(f"  Best strength={best_strength:.4f}, evaluating...")
             attacked._inner.update_corrupt_args({"dims": dims, "strength": best_strength})
             afe, cfe, results = evaluate_config(attacked)
             path = result_path(method, dims=dims, strength=round(best_strength, 4))
@@ -274,14 +266,14 @@ for method in args.methods:
 # Summary
 # ---------------------------------------------------------------------------
 
-print(f"\n{'='*60}")
-print("RESULTS SUMMARY (sorted by AFE)")
-print(f"{'='*60}")
+log_print(f"\n{'='*60}")
+log_print("RESULTS SUMMARY (sorted by AFE)")
+log_print(f"{'='*60}")
 
 all_sweep_results.sort(key=lambda x: x["AFE"], reverse=True)
-print(f"{'Method':<30} {'Dims':>6} {'Strength':>10} {'AFE':>8} {'CFE':>8}")
-print("-" * 66)
+log_print(f"{'Method':<30} {'Dims':>6} {'Strength':>10} {'AFE':>8} {'CFE':>8}")
+log_print("-" * 66)
 for r in all_sweep_results:
     dims_str = str(r.get("dims", "-"))
     str_str = f"{r['strength']:.2f}" if "strength" in r else "-"
-    print(f"{r['method']:<30} {dims_str:>6} {str_str:>10} {r['AFE']:>8.4f} {r['CFE']:>8.4f}")
+    log_print(f"{r['method']:<30} {dims_str:>6} {str_str:>10} {r['AFE']:>8.4f} {r['CFE']:>8.4f}")

@@ -10,7 +10,6 @@ import argparse
 import json
 import os
 
-from scipy.stats import hmean
 from transformers import GenerationConfig
 
 from eco.attack import AttackedModel, PromptClassifier
@@ -25,7 +24,7 @@ from eco.evaluator import (
 )
 from eco.inference import ReasoningGenerationEngine
 from eco.model import HFModel, ReasoningModel
-from eco.utils import seed_everything
+from eco.utils import compute_afe, compute_cfe, log_print, seed_everything
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -52,7 +51,7 @@ args = parser.parse_args()
 seed_everything(args.seed)
 
 # Load model
-print(f"Loading model: {args.model_name}")
+log_print(f"Loading model: {args.model_name}")
 generation_config = GenerationConfig(
     do_sample=False,
     max_new_tokens=args.max_new_tokens,
@@ -69,7 +68,7 @@ model = HFModel(
 
 # Optionally wrap with corruption
 if args.corrupt_method is not None:
-    print(f"Loading prompt classifier: rtofu_classifiers/{args.split}")
+    log_print(f"Loading prompt classifier: rtofu_classifiers/{args.split}")
     prompt_classifier = PromptClassifier(
         model_name="roberta-base",
         model_path=f"rtofu_classifiers/{args.split}",
@@ -107,7 +106,7 @@ if args.num_examples > 0:
         n = min(args.num_examples, len(rtofu.dataset[name]))
         rtofu.dataset[name] = rtofu.dataset[name].select(range(n))
 
-print(f"Evaluating on subsets: {subset_names}")
+log_print(f"Evaluating on subsets: {subset_names}")
 
 # Answer evaluators (AFE)
 answer_evaluators = [
@@ -141,36 +140,11 @@ all_results = {}
 for r in summary:
     all_results.update(r)
 
-# AFE = hmean(1 - forget_rouge, 1 - forget_cosine, 1 - forget_entailment)
 forget_prefix = f"rtofu_{args.split}"
-afe_metrics = ["rougeL_recall", "cosine_similarity", "entailment_score"]
-afe_forget_scores = []
-for metric in afe_metrics:
-    key = f"{forget_prefix}_{metric}"
-    if key in all_results:
-        afe_forget_scores.append(1.0 - all_results[key])
-
-if afe_forget_scores:
-    if all(s > 0 for s in afe_forget_scores):
-        all_results["AFE"] = float(hmean(afe_forget_scores))
-    else:
-        all_results["AFE"] = 0.0
-    print(f"AFE: {all_results['AFE']:.4f}")
-
-# CFE = hmean(1 - forget_cot_rouge, 1 - forget_cot_cosine)
-cfe_metrics = ["stepwise_rougeL_recall", "stepwise_cosine_similarity"]
-cfe_forget_scores = []
-for metric in cfe_metrics:
-    key = f"{forget_prefix}_cot_{metric}"
-    if key in all_results:
-        cfe_forget_scores.append(1.0 - all_results[key])
-
-if cfe_forget_scores:
-    if all(s > 0 for s in cfe_forget_scores):
-        all_results["CFE"] = float(hmean(cfe_forget_scores))
-    else:
-        all_results["CFE"] = 0.0
-    print(f"CFE: {all_results['CFE']:.4f}")
+all_results["AFE"] = compute_afe(all_results, forget_prefix)
+all_results["CFE"] = compute_cfe(all_results, forget_prefix)
+log_print(f"AFE: {all_results['AFE']:.4f}")
+log_print(f"CFE: {all_results['CFE']:.4f}")
 
 # Save results
 os.makedirs(args.output_dir, exist_ok=True)
@@ -186,4 +160,4 @@ run_name = "_".join(
 output_path = os.path.join(args.output_dir, f"{run_name}.json")
 with open(output_path, "w") as f:
     json.dump(all_results, f, indent=2)
-print(f"\nResults saved to {output_path}")
+log_print(f"\nResults saved to {output_path}")

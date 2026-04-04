@@ -7,7 +7,7 @@ from itertools import product
 import numpy as np
 import torch
 import yaml
-from scipy.stats import ks_2samp
+from scipy.stats import hmean, ks_2samp
 from tabulate import tabulate
 
 
@@ -104,6 +104,64 @@ def format_dict_for_name(d):
 
 def merge_dicts(dicts):
     return {k: v for d in dicts for k, v in d.items()}
+
+
+def compute_afe(results, subset_prefix):
+    """Compute Answer Forget Efficacy from evaluation results.
+
+    AFE = hmean(1 - ROUGE-L_recall, 1 - cosine_similarity, 1 - entailment_score)
+          * think_completion_rate
+
+    The think_completion_rate multiplier discounts AFE when many responses
+    lack a </think> delimiter, preventing the optimizer from exploiting
+    empty answers for artificially high scores.
+
+    Args:
+        results: Dict of metric_key -> score from engine summary.
+        subset_prefix: Key prefix for the subset, e.g. "rtofu_forget10".
+
+    Returns:
+        AFE score (float), or 0.0 if any component is non-positive.
+    """
+    metrics = ["rougeL_recall", "cosine_similarity", "entailment_score"]
+    scores = []
+    for metric in metrics:
+        key = f"{subset_prefix}_{metric}"
+        if key in results:
+            scores.append(1.0 - results[key])
+    if scores and all(s > 0 for s in scores):
+        afe = float(hmean(scores))
+    else:
+        afe = 0.0
+
+    rate_key = f"{subset_prefix}_think_completion_rate"
+    if rate_key in results:
+        afe *= results[rate_key]
+
+    return afe
+
+
+def compute_cfe(results, subset_prefix):
+    """Compute CoT Forget Efficacy from evaluation results.
+
+    CFE = hmean(1 - stepwise_ROUGE-L_recall, 1 - stepwise_cosine_similarity)
+
+    Args:
+        results: Dict of metric_key -> score from engine summary.
+        subset_prefix: Key prefix for the subset, e.g. "rtofu_forget10".
+
+    Returns:
+        CFE score (float), or 0.0 if any component is non-positive.
+    """
+    metrics = ["stepwise_rougeL_recall", "stepwise_cosine_similarity"]
+    scores = []
+    for metric in metrics:
+        key = f"{subset_prefix}_cot_{metric}"
+        if key in results:
+            scores.append(1.0 - results[key])
+    if scores and all(s > 0 for s in scores):
+        return float(hmean(scores))
+    return 0.0
 
 
 def delete_model(model):
