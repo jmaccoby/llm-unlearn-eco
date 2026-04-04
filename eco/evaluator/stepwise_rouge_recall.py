@@ -4,13 +4,11 @@ from eco.evaluator.utils import split_sentences
 
 
 class StepWiseROUGERecall:
-    name = "stepwise_rouge_recall"
+    name = "stepwise_rougeL_recall"  # matches default mode="rougeL"
 
     def __init__(self, mode="rougeL"):
         self.mode = mode
-        self.scorer = rouge_scorer.RougeScorer(
-            ["rouge1", "rouge2", "rougeL"], use_stemmer=True
-        )
+        self.scorer = rouge_scorer.RougeScorer([mode], use_stemmer=True)
         self.name = f"stepwise_{mode}_recall"
 
     def evaluate(self, answers, generated_answers):
@@ -21,6 +19,10 @@ class StepWiseROUGERecall:
             if not gold_steps or not gen_steps:
                 scores.append(0.0)
                 continue
+            # NOTE: best-match alignment allows a single verbose generated
+            # step to be selected as the best match for every gold step,
+            # which can inflate scores when the model consolidates multiple
+            # reasoning steps into one.
             step_scores = []
             for g_step in gold_steps:
                 best = max(

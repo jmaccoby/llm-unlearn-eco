@@ -27,6 +27,10 @@ class StepWiseCosineSimilarity:
                 gold_embs = self.model.encode(gold_steps, show_progress_bar=False)
                 gen_embs = self.model.encode(gen_steps, show_progress_bar=False)
                 sim_matrix = cosine_similarity(gold_embs, gen_embs)
+                # NOTE: best-match alignment allows a single verbose
+                # generated step to match every gold step, which can
+                # inflate scores when the model consolidates multiple
+                # reasoning steps into one.
                 best_scores = np.clip(sim_matrix.max(axis=1), 0.0, 1.0)
                 scores.append(float(best_scores.mean()))
         return scores

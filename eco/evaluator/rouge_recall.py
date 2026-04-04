@@ -7,9 +7,7 @@ class ROUGERecall:
     def __init__(self, mode="rougeL"):
         super().__init__()
         self.mode = mode
-        self.scorer = rouge_scorer.RougeScorer(
-            ["rouge1", "rouge2", "rougeL"], use_stemmer=True
-        )
+        self.scorer = rouge_scorer.RougeScorer([mode], use_stemmer=True)
         self.name = f"{mode}_recall"
 
     def evaluate(self, answers, generated_answers):
