@@ -98,13 +98,10 @@ loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
 print(f"Class weights: {class_weights}")
 
 
-class CustomTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        labels = inputs.pop("labels")
-        outputs = model(**inputs)
-        logits = outputs.get("logits")
-        loss = loss_fn(logits.view(-1, self.model.config.num_labels), labels.view(-1))
-        return (loss, outputs) if return_outputs else loss
+def compute_loss_fn(outputs, labels, num_items_in_batch=None):
+    logits = outputs.get("logits")
+    loss = loss_fn(logits.view(-1, logits.shape[-1]), labels.view(-1))
+    return loss
 
 
 data_collator = DataCollatorWithPadding(
@@ -154,7 +151,7 @@ training_args = TrainingArguments(
     report_to="none",
 )
 
-trainer = CustomTrainer(
+trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=tokenized_datasets["train"],
@@ -163,8 +160,8 @@ trainer = CustomTrainer(
     },
     compute_metrics=compute_metrics,
     data_collator=data_collator,
+    compute_loss_func=compute_loss_fn,
 )
-trainer.model_accepts_loss_kwargs=False
 trainer.train()
 if args.dataset_name in {"tofu", "rtofu"}:
     trainer.save_model(f"{args.dataset_name}_classifiers/{args.tofu_subset_name}")

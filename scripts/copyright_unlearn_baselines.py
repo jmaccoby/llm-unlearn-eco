@@ -115,7 +115,7 @@ class CustomTrainer(Trainer):
             self.has_printed = False
             self.previous_step = None
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if self.loss == "ft":
             inputs = {
                 "input_ids": inputs["retain_input_ids"],
