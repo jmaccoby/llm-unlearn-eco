@@ -1,4 +1,5 @@
 import gc
+import os
 import random
 from copy import deepcopy
 from itertools import product
@@ -8,6 +9,22 @@ import torch
 import yaml
 from scipy.stats import ks_2samp
 from tabulate import tabulate
+
+
+def log_print(*args, **kwargs):
+    """Print that flushes immediately, bypassing conda run buffering.
+
+    Drop-in replacement for ``print()`` — accepts the same arguments.
+    Also writes to a log file if the ``LOG_FILE`` environment variable is set.
+    """
+    kwargs.setdefault("flush", True)
+    print(*args, **kwargs)
+    log_path = os.environ.get("LOG_FILE")
+    if log_path:
+        with open(log_path, "a") as f:
+            file_kwargs = {k: v for k, v in kwargs.items() if k != "flush"}
+            file_kwargs["file"] = f
+            print(*args, **file_kwargs)
 
 
 def ks_test(unlearn_tr, retain_tr):
