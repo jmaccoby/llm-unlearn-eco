@@ -113,3 +113,26 @@ def idx_to_mask(idx, length):
 
 def mask_to_idx(mask):
     return [i for i, m in enumerate(mask) if m == 1]
+
+
+def build_prefix_corruption_mask(
+    prompt_len: int,
+    think_len: int,
+    prefix_len: int,
+    window: int,
+    batch_size: int = 1,
+) -> list[list[int]]:
+    """Build a position mask that corrupts only the last ``window`` tokens
+    of the clean CoT prefix.
+
+    The mask layout is::
+
+        [0]*prompt_len + [0]*think_len + [0]*(prefix_len - window) + [1]*window
+
+    ``window`` is clamped to ``prefix_len`` so the prompt and think tokens
+    are never corrupted.
+    """
+    window = min(window, prefix_len)
+    clean_len = prompt_len + think_len + (prefix_len - window)
+    mask = [0] * clean_len + [1] * window
+    return [mask] * batch_size

@@ -67,6 +67,29 @@ class AttackedModel:
         self.apply_corruption(prompts)
         return self.model.generate(*args, **kwargs)
 
+    def generate_with_mask(self, pos_mask, *args, **kwargs):
+        """Generate with a custom corruption mask (skips classifiers).
+
+        Parameters
+        ----------
+        pos_mask : list[list[int]]
+            Per-batch, per-token binary mask. 1 = corrupt, 0 = leave clean.
+        """
+        if (
+            "olmo" in self.model_name.lower()
+            or "qwen" in self.model_name.lower()
+            or self.model_name == "falcon-180B-chat"
+        ):
+            kwargs.pop("token_type_ids", None)
+        self.remove_hooks()
+        corrupt_args = self.corrupt_args.copy()
+        corrupt_args["pos"] = pos_mask
+        handle = apply_corruption_hook(
+            self.attack_module, self.corrupt_method, corrupt_args
+        )
+        self._hook_handles.append(handle)
+        return self.model.generate(*args, **kwargs)
+
     def apply_corruption(self, prompt, answers=None):
         if self.prompt_classifier is not None:
             prompt_attack_label = self.predict_prompt_attack_label(prompt)
