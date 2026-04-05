@@ -202,7 +202,10 @@ class CoTLeakDetector:
         # Stage 1 flagged sentences but none were individually confirmed.
         # Check the full CoT against the top-k most similar claims to catch
         # distributed leaks spread across multiple sentences.
-        if self._entails_any_claim(generated_cot, top_k=self.fallback_top_k):
+        # (fallback_top_k=0 disables this check.)
+        if self.fallback_top_k > 0 and self._entails_any_claim(
+            generated_cot, top_k=self.fallback_top_k
+        ):
             return LeakDetectionResult(
                 is_leaking=True,
                 first_leak_index=0,  # can't pinpoint; truncate from start
@@ -269,6 +272,6 @@ class CoTLeakDetector:
             ]
             results = self.nli(pairs, truncation=True, max_length=512)
             for result in results:
-                if result["label"] == "entailment":
+                if result["label"].lower() == "entailment":
                     return True
         return False

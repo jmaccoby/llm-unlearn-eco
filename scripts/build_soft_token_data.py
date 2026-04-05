@@ -99,7 +99,7 @@ def sentence_is_leaking(sentence: str) -> bool:
         ]
         results = nli(pairs, truncation=True, max_length=512)
         for result in results:
-            if result["label"] == "entailment":
+            if result["label"].lower() == "entailment":
                 return True
     return False
 

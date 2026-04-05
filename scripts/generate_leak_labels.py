@@ -197,7 +197,7 @@ def label_sentence(sentence: str) -> int:
         ]
         results = nli(pairs, truncation=True, max_length=512)
         for result in results:
-            if result["label"] == "entailment":
+            if result["label"].lower() == "entailment":
                 return 1
     return 0
 

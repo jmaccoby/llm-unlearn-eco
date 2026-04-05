@@ -36,6 +36,8 @@ class SoftToken(nn.Module):
 
         def hook(mod, inputs, outputs):
             if outputs.shape[1] > 1:  # prefill only
+                # Clone to avoid in-place write that severs autograd graph
+                outputs = outputs.clone()
                 outputs[:, token_position, :] = emb.to(
                     device=outputs.device, dtype=outputs.dtype
                 )

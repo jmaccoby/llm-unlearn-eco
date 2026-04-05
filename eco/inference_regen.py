@@ -153,6 +153,9 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
 
                         prompt = prompts[sample_idx]
 
+                        best_cot = batch_cot[sample_idx]
+                        best_answer = batch_answer[sample_idx]
+
                         for attempt in range(self.regen_max_attempts):
                             regen_cot, regen_answer = self._regenerate_sample(
                                 prompt, clean_prefix, attempt
@@ -162,6 +165,7 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
                             new_result = self.leak_detector.detect(regen_cot)
 
                             if not new_result.is_leaking:
+                                best_cot, best_answer = regen_cot, regen_answer
                                 log_print(
                                     f"  Regeneration succeeded on attempt {attempt + 1}"
                                 )
@@ -182,8 +186,8 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
                                 f"  Regeneration exhausted {self.regen_max_attempts} attempts"
                             )
 
-                        batch_cot[sample_idx] = regen_cot
-                        batch_answer[sample_idx] = regen_answer
+                        batch_cot[sample_idx] = best_cot
+                        batch_answer[sample_idx] = best_answer
 
                 all_gold_answers.append(gold_answers)
                 all_gold_cots.append(gold_cots)
@@ -236,7 +240,7 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
         )
         prompt_len = prompt_tok["input_ids"].shape[1]
         think_len = self.model.n_think_tokens
-        prefix_token_len = total_len - prompt_len - think_len
+        prefix_token_len = max(0, total_len - prompt_len - think_len)
 
         # Build corruption mask and optionally prepare soft token
         mask, input_ids, attention_mask, st_handle = self._build_regen_corruption(
@@ -247,6 +251,11 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
         # Unwrap ReasoningModel to get AttackedModel (think prefix is already
         # in the input, so we bypass ReasoningModel.generate())
         inner = self.model._inner
+        if not hasattr(inner, "generate_with_mask"):
+            raise TypeError(
+                f"Regeneration requires a model with generate_with_mask() "
+                f"(e.g. AttackedModel), got {type(inner).__name__}"
+            )
 
         try:
             generated = inner.generate_with_mask(

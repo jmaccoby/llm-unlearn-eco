@@ -156,6 +156,11 @@ class LeakingDummyModel:
         return torch.tensor(padded)
 
     def generate_with_mask(self, pos_mask, *args, **kwargs):
+        """Matches AttackedModel.generate_with_mask interface."""
+        self.remove_hooks()
+        return self.generate(*args, **kwargs)
+
+    def generate_with_mask(self, pos_mask, *args, **kwargs):
         """Mimic AttackedModel.generate_with_mask — just delegates to generate."""
         self.remove_hooks()
         return self.generate(*args, **kwargs)

@@ -61,6 +61,14 @@ parser.add_argument("--regen_max_attempts", type=int, default=3)
 parser.add_argument("--soft_token_path", type=str, default=None, help="Path to trained soft token embedding")
 args = parser.parse_args()
 
+# Validate argument combinations
+if args.regen_corrupt_mode is not None and args.leak_classifier_path is None:
+    parser.error("--regen_corrupt_mode requires --leak_classifier_path")
+if args.soft_token_path is not None and (
+    args.regen_corrupt_mode is None or "soft_token" not in args.regen_corrupt_mode
+):
+    parser.error("--soft_token_path requires --regen_corrupt_mode to be 'soft_token' or 'window+soft_token'")
+
 seed_everything(args.seed)
 
 # Load model
