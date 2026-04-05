@@ -12,6 +12,7 @@ Usage:
     python -m scripts.generate_leak_labels --split forget05 --batch_size 4
 """
 import argparse
+import json as _json
 import os
 
 import numpy as np
@@ -289,3 +290,13 @@ dataset_dict.save_to_disk(output_path)
 log_print(f"\nDataset saved to {output_path}")
 log_print(f"  Train: {len(train_ds)}, Test: {len(test_ds)}")
 log_print(f"  Forget eval: {len(forget_eval_ds)}, Retain eval: {len(retain_eval_ds)}")
+
+# Save raw CoTs for soft token training data construction
+raw_cots_path = f"{args.output_dir}/{args.split}/raw_cots.json"
+_json.dump({
+    "forget_cots": forget_cots,
+    "retain_cots": retain_cots,
+    "forget_prompts": list(forget_ds["prompt_formatted"]),
+    "retain_prompts": list(retain_ds["prompt_formatted"]),
+}, open(raw_cots_path, "w"), indent=2)
+log_print(f"Raw CoTs saved to {raw_cots_path}")
