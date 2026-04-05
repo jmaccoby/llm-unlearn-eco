@@ -160,11 +160,6 @@ class LeakingDummyModel:
         self.remove_hooks()
         return self.generate(*args, **kwargs)
 
-    def generate_with_mask(self, pos_mask, *args, **kwargs):
-        """Mimic AttackedModel.generate_with_mask — just delegates to generate."""
-        self.remove_hooks()
-        return self.generate(*args, **kwargs)
-
 
 class AlwaysLeakingDummyModel(LeakingDummyModel):
     """Always produces leaking output, regardless of call count."""

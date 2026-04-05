@@ -144,7 +144,7 @@ cot_evaluators = [
 ]
 
 # Run generation + evaluation
-if args.regen_corrupt_mode is not None and args.leak_classifier_path is not None:
+if args.regen_corrupt_mode is not None:  # validation ensures leak_classifier_path is set
     from eco.attack.leak_detector import CoTLeakDetector
     from eco.attack.soft_token import SoftToken
     from eco.inference_regen import RegeneratingReasoningEngine

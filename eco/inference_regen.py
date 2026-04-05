@@ -59,6 +59,15 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
             comparison_length=comparison_length,
             truncate_answers=truncate_answers,
         )
+        if regen_corrupt_mode not in ("window", "soft_token", "window+soft_token"):
+            raise ValueError(
+                f"Unknown regen_corrupt_mode: {regen_corrupt_mode!r}"
+            )
+        if "soft_token" in regen_corrupt_mode and soft_token is None:
+            raise ValueError(
+                f"regen_corrupt_mode={regen_corrupt_mode!r} requires "
+                f"soft_token to be provided"
+            )
         self.leak_detector = leak_detector
         self.regen_corrupt_mode = regen_corrupt_mode
         self.regen_window = regen_window
@@ -238,29 +247,27 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
 
         Returns (cot, answer) strings.
         """
-        think_prefix = ReasoningModel.THINK_PREFIX
-        extended_text = prompt + think_prefix + clean_prefix
+        # Build input_ids by concatenating token lists to avoid BPE
+        # context-sensitivity at boundaries.  Tokenizing a joined string
+        # and then subtracting lengths is unreliable because BPE may
+        # merge or split tokens differently at concatenation points.
+        prompt_ids = self.tokenizer(
+            prompt, add_special_tokens=True
+        )["input_ids"]
+        think_ids = self.tokenizer(
+            ReasoningModel.THINK_PREFIX, add_special_tokens=False
+        )["input_ids"]
+        prefix_ids = self.tokenizer(
+            clean_prefix, add_special_tokens=False
+        )["input_ids"] if clean_prefix else []
 
-        # Tokenize the extended input with left-padding
-        extended_tok = self.tokenizer(
-            [extended_text],
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=2048,
-        ).to(self.model.device)
+        prompt_len = len(prompt_ids)
+        think_len = len(think_ids)
+        prefix_token_len = len(prefix_ids)
 
-        input_ids = extended_tok["input_ids"]
-        attention_mask = extended_tok["attention_mask"]
-        total_len = input_ids.shape[1]
-
-        # Compute token boundaries
-        prompt_tok = self.tokenizer(
-            prompt, add_special_tokens=True, return_tensors="pt"
-        )
-        prompt_len = prompt_tok["input_ids"].shape[1]
-        think_len = self.model.n_think_tokens
-        prefix_token_len = max(0, total_len - prompt_len - think_len)
+        all_ids = prompt_ids + think_ids + prefix_ids
+        input_ids = torch.tensor([all_ids], device=self.model.device)
+        attention_mask = torch.ones_like(input_ids)
 
         # Build corruption mask and optionally prepare soft token
         mask, input_ids, attention_mask, st_handle = self._build_regen_corruption(
@@ -386,8 +393,8 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
             retained_tokens = self.tokenizer(
                 retained_text, add_special_tokens=False
             )["input_ids"]
-            return min(
-                prefix_token_len - len(retained_tokens), prefix_token_len
+            return max(
+                0, min(prefix_token_len - len(retained_tokens), prefix_token_len)
             )
         else:
             # Token mode: base window doubles each attempt
