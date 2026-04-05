@@ -93,6 +93,45 @@ def save_knowledge_bank(
 # Detector
 # ------------------------------------------------------------------
 
+def entails_any_claim(
+    text: str,
+    claims: list[str],
+    bank_embeddings: np.ndarray,
+    st_model,
+    nli,
+    cosine_prefilter: float = 0.3,
+    nli_batch_size: int = 16,
+    top_k: int | None = None,
+) -> bool:
+    """Check if *text* entails any claim via cosine pre-filter + NLI.
+
+    Standalone function used by both :class:`CoTLeakDetector` and the
+    training data generation scripts to avoid duplicating the logic.
+    """
+    text_emb = st_model.encode(text, show_progress_bar=False)
+    sims = cosine_similarity([text_emb], bank_embeddings)[0]
+
+    if top_k is not None:
+        candidate_indices = np.argsort(sims)[::-1][:top_k].tolist()
+    else:
+        above = np.where(sims >= cosine_prefilter)[0]
+        candidate_indices = above[np.argsort(sims[above])[::-1]].tolist()
+
+    if not candidate_indices:
+        return False
+
+    for batch_start in range(0, len(candidate_indices), nli_batch_size):
+        batch_idx = candidate_indices[
+            batch_start : batch_start + nli_batch_size
+        ]
+        pairs = [{"text": text, "text_pair": claims[i]} for i in batch_idx]
+        results = nli(pairs, truncation=True, max_length=512)
+        for result in results:
+            if result["label"].lower() == "entailment":
+                return True
+    return False
+
+
 class CoTLeakDetector:
     """Two-stage CoT leak detector.
 
@@ -234,44 +273,14 @@ class CoTLeakDetector:
     def _entails_any_claim(
         self, text: str, top_k: int | None = None
     ) -> bool:
-        """Check if *text* entails any claim in the knowledge bank.
-
-        Uses cosine similarity as a pre-filter, then runs NLI on
-        candidate claims sorted by descending similarity.
-
-        Parameters
-        ----------
-        text : str
-            A single sentence or the full CoT text.
-        top_k : int | None
-            If given, only check the *top_k* most similar claims
-            (regardless of the cosine pre-filter threshold).
-        """
-        text_emb = self.st_model.encode(text, show_progress_bar=False)
-        sims = cosine_similarity([text_emb], self.bank_embeddings)[0]
-
-        if top_k is not None:
-            # Take the top_k most similar, ignoring the threshold.
-            candidate_indices = np.argsort(sims)[::-1][:top_k].tolist()
-        else:
-            # Filter by cosine threshold, then sort descending.
-            above = np.where(sims >= self.cosine_prefilter)[0]
-            candidate_indices = above[np.argsort(sims[above])[::-1]].tolist()
-
-        if not candidate_indices:
-            return False
-
-        # Run NLI on candidates.  Process in batches for efficiency but
-        # check results eagerly so we can stop early.
-        for batch_start in range(0, len(candidate_indices), self.nli_batch_size):
-            batch_idx = candidate_indices[
-                batch_start : batch_start + self.nli_batch_size
-            ]
-            pairs = [
-                {"text": text, "text_pair": self.claims[i]} for i in batch_idx
-            ]
-            results = self.nli(pairs, truncation=True, max_length=512)
-            for result in results:
-                if result["label"].lower() == "entailment":
-                    return True
-        return False
+        """Delegate to the module-level :func:`entails_any_claim`."""
+        return entails_any_claim(
+            text,
+            self.claims,
+            self.bank_embeddings,
+            self.st_model,
+            self.nli,
+            cosine_prefilter=self.cosine_prefilter,
+            nli_batch_size=self.nli_batch_size,
+            top_k=top_k,
+        )

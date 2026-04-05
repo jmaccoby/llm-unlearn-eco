@@ -232,6 +232,9 @@ run_name = "_".join(
         args.corrupt_method or "baseline",
         f"dims={args.dims}" if args.dims else None,
         f"str={args.strength}" if args.strength else None,
+        f"regen={args.regen_corrupt_mode}" if args.regen_corrupt_mode else None,
+        f"w={args.regen_window}" if args.regen_corrupt_mode else None,
+        f"att={args.regen_max_attempts}" if args.regen_corrupt_mode else None,
     ])
 )
 output_path = os.path.join(args.output_dir, f"{run_name}.json")

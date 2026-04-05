@@ -19,10 +19,9 @@ import numpy as np
 import torch
 from datasets import Dataset, DatasetDict
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 from transformers import GenerationConfig, pipeline
 
-from eco.attack.leak_detector import load_knowledge_bank
+from eco.attack.leak_detector import entails_any_claim, load_knowledge_bank
 from eco.dataset.rtofu import RTOFU
 from eco.evaluator.utils import split_sentences
 from eco.model import HFModel, ReasoningModel
@@ -179,27 +178,10 @@ def generate_cots(dataset, desc="Generating"):
 
 def label_sentence(sentence: str) -> int:
     """Check if a sentence entails any knowledge bank claim. Returns 0 or 1."""
-    emb = st_model.encode(sentence, show_progress_bar=False)
-    sims = cosine_similarity([emb], bank_embeddings)[0]
-
-    # Pre-filter by cosine similarity
-    above = np.where(sims >= args.cosine_prefilter)[0]
-    if len(above) == 0:
-        return 0
-    # Sort by descending similarity
-    candidates = above[np.argsort(sims[above])[::-1]]
-
-    # Check entailment
-    for batch_start in range(0, len(candidates), 16):
-        batch_idx = candidates[batch_start : batch_start + 16]
-        pairs = [
-            {"text": sentence, "text_pair": claims[i]} for i in batch_idx
-        ]
-        results = nli(pairs, truncation=True, max_length=512)
-        for result in results:
-            if result["label"].lower() == "entailment":
-                return 1
-    return 0
+    return int(entails_any_claim(
+        sentence, claims, bank_embeddings, st_model, nli,
+        cosine_prefilter=args.cosine_prefilter,
+    ))
 
 
 # -------------------------------------------------------------------------

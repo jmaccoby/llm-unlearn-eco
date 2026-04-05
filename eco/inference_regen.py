@@ -147,6 +147,15 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
                             continue
 
                         first_leak_index = result.first_leak_index
+                        if first_leak_index == 0:
+                            # Fallback detected distributed leak but can't
+                            # pinpoint a sentence — no clean prefix to keep.
+                            # Skip regeneration for this sample.
+                            log_print(
+                                f"  Sample {sample_idx}: leak at index 0, "
+                                f"skipping regeneration (no clean prefix)"
+                            )
+                            continue
                         clean_prefix = " ".join(
                             result.sentences[:first_leak_index]
                         )
@@ -188,6 +197,13 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
 
                         batch_cot[sample_idx] = best_cot
                         batch_answer[sample_idx] = best_answer
+                        # Keep batch_responses consistent with cot/answer
+                        if best_answer:
+                            batch_responses[sample_idx] = (
+                                best_cot + self.THINK_SUFFIX + best_answer
+                            )
+                        else:
+                            batch_responses[sample_idx] = best_cot
 
                 all_gold_answers.append(gold_answers)
                 all_gold_cots.append(gold_cots)
@@ -356,15 +372,19 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
             # Sentence count escalates: 1, 2, 4, ... (doubling per attempt)
             n_sentences = min(1 * (2 ** attempt), len(sentences))
 
-            # Take the last n_sentences from the prefix
-            window_sentences = sentences[-n_sentences:]
-            window_text = " ".join(window_sentences)
-
-            # Re-tokenize to get token count
-            window_tokens = self.tokenizer(
-                window_text, add_special_tokens=False
+            # Compute window by tokenizing the *retained* (non-window) portion
+            # and subtracting from total prefix tokens. This avoids BPE context
+            # mismatch from tokenizing the window fragment in isolation.
+            retained_sentences = sentences[:-n_sentences]
+            if not retained_sentences:
+                return prefix_token_len  # corrupt entire prefix
+            retained_text = " ".join(retained_sentences)
+            retained_tokens = self.tokenizer(
+                retained_text, add_special_tokens=False
             )["input_ids"]
-            return min(len(window_tokens), prefix_token_len)
+            return min(
+                prefix_token_len - len(retained_tokens), prefix_token_len
+            )
         else:
             # Token mode: base window doubles each attempt
             return min(self.regen_window * (2 ** attempt), prefix_token_len)
