@@ -51,6 +51,14 @@ parser.add_argument("--leak_classifier_path", type=str, default=None, help="Path
 parser.add_argument("--knowledge_bank_dir", type=str, default=None, help="Path to knowledge bank directory")
 parser.add_argument("--leak_classifier_threshold", type=float, default=0.5)
 parser.add_argument("--leak_cosine_prefilter", type=float, default=0.3)
+# Regeneration arguments
+parser.add_argument("--regen_corrupt_mode", type=str, default=None,
+                    choices=["window", "soft_token", "window+soft_token"],
+                    help="Corruption mode for regeneration (None = disabled)")
+parser.add_argument("--regen_window", type=int, default=32)
+parser.add_argument("--regen_window_mode", type=str, default="sentences", choices=["tokens", "sentences"])
+parser.add_argument("--regen_max_attempts", type=int, default=3)
+parser.add_argument("--soft_token_path", type=str, default=None, help="Path to trained soft token embedding")
 args = parser.parse_args()
 
 seed_everything(args.seed)
@@ -128,15 +136,49 @@ cot_evaluators = [
 ]
 
 # Run generation + evaluation
-engine = ReasoningGenerationEngine(
-    model=model,
-    tokenizer=model.tokenizer,
-    data_module=rtofu,
-    subset_names=subset_names,
-    answer_evaluator=answer_evaluators,
-    cot_evaluator=cot_evaluators,
-    batch_size=args.batch_size,
-)
+if args.regen_corrupt_mode is not None and args.leak_classifier_path is not None:
+    from eco.attack.leak_detector import CoTLeakDetector
+    from eco.attack.soft_token import SoftToken
+    from eco.inference_regen import RegeneratingReasoningEngine
+
+    kb_dir = args.knowledge_bank_dir or f"knowledge_banks/{args.split}"
+    leak_detector = CoTLeakDetector(
+        classifier_path=args.leak_classifier_path,
+        knowledge_bank_dir=kb_dir,
+        classifier_threshold=args.leak_classifier_threshold,
+        cosine_prefilter=args.leak_cosine_prefilter,
+    )
+    soft_token = None
+    if args.soft_token_path is not None:
+        soft_token = SoftToken.load(args.soft_token_path, embed_dim=model.model_config["embedding_dim"])
+        log_print(f"Loaded soft token from {args.soft_token_path}")
+
+    engine = RegeneratingReasoningEngine(
+        model=model,
+        tokenizer=model.tokenizer,
+        data_module=rtofu,
+        subset_names=subset_names,
+        answer_evaluator=answer_evaluators,
+        cot_evaluator=cot_evaluators,
+        batch_size=args.batch_size,
+        leak_detector=leak_detector,
+        regen_corrupt_mode=args.regen_corrupt_mode,
+        regen_window=args.regen_window,
+        regen_window_mode=args.regen_window_mode,
+        regen_max_attempts=args.regen_max_attempts,
+        soft_token=soft_token,
+    )
+    log_print(f"Regeneration enabled: mode={args.regen_corrupt_mode}, max_attempts={args.regen_max_attempts}")
+else:
+    engine = ReasoningGenerationEngine(
+        model=model,
+        tokenizer=model.tokenizer,
+        data_module=rtofu,
+        subset_names=subset_names,
+        answer_evaluator=answer_evaluators,
+        cot_evaluator=cot_evaluators,
+        batch_size=args.batch_size,
+    )
 engine.inference()
 summary, outputs = engine.summary()
 
@@ -151,13 +193,13 @@ all_results["CFE"] = compute_cfe(all_results, forget_prefix)
 log_print(f"AFE: {all_results['AFE']:.4f}")
 log_print(f"CFE: {all_results['CFE']:.4f}")
 
-# Optional: run leak detection on generated CoTs
-if args.leak_classifier_path is not None:
+# Run standalone leak detection (when regen is disabled but detector is available)
+if args.leak_classifier_path is not None and args.regen_corrupt_mode is None:
     from eco.attack.leak_detector import CoTLeakDetector
 
     kb_dir = args.knowledge_bank_dir or f"knowledge_banks/{args.split}"
     log_print(f"\nRunning leak detection (classifier={args.leak_classifier_path})")
-    leak_detector = CoTLeakDetector(
+    standalone_detector = CoTLeakDetector(
         classifier_path=args.leak_classifier_path,
         knowledge_bank_dir=kb_dir,
         classifier_threshold=args.leak_classifier_threshold,
@@ -166,7 +208,7 @@ if args.leak_classifier_path is not None:
 
     for key, cot_data in engine.cot_generations.items():
         generated_cots = cot_data["generated"]
-        results_list = leak_detector.detect_batch(generated_cots)
+        results_list = standalone_detector.detect_batch(generated_cots)
         n_leaking = sum(1 for r in results_list if r.is_leaking)
         n_total = len(results_list)
         leak_rate = n_leaking / n_total if n_total > 0 else 0.0
