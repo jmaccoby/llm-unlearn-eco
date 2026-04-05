@@ -64,11 +64,18 @@ def compute_metrics(eval_pred):
     fn = np.sum((predictions == 0) & (labels == 1))
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    beta = 2.0  # favor recall over precision for Stage 1 screening
+    fbeta = (
+        (1 + beta**2) * precision * recall / (beta**2 * precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
     return {
         "errors": errors,
         "acc": accuracy,
         "precision": precision,
         "recall": recall,
+        "f2": fbeta,
     }
 
 
@@ -136,7 +143,7 @@ training_args = TrainingArguments(
     save_steps=100,
     save_total_limit=10,
     load_best_model_at_end=True,
-    metric_for_best_model="test_recall",
+    metric_for_best_model="test_f2",
     greater_is_better=True,
     report_to="none",
 )
