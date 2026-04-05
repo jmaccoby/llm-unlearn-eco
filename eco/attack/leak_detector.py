@@ -20,7 +20,7 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import pipeline
 
-from eco.attack.classifier import PromptClassifier
+from eco.attack.classifier import CorruptionClassifier
 from eco.evaluator.utils import split_sentences
 
 
@@ -127,8 +127,8 @@ class CoTLeakDetector:
         nli_batch_size: int = 16,
         fallback_top_k: int = 10,
     ):
-        # Stage 1 — sentence classifier (reuses PromptClassifier)
-        self.classifier = PromptClassifier(
+        # Stage 1 — sentence classifier
+        self.classifier = CorruptionClassifier(
             model_name="roberta-base",
             model_path=classifier_path,
             batch_size=32,

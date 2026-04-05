@@ -27,7 +27,14 @@ class Classifier:
         )
 
 
-class PromptClassifier(Classifier):
+class CorruptionClassifier(Classifier):
+    """Binary text classifier for the corruption/unlearning pipeline.
+
+    Used both as a prompt classifier (decides which prompts to corrupt)
+    and as a sentence-level leak classifier (detects forget-set knowledge
+    in generated CoT sentences).
+    """
+
     task = "text-classification"
 
     def __init__(self, model_name, model_path, batch_size):
@@ -47,6 +54,10 @@ class PromptClassifier(Classifier):
                 1 if pred["label"] == "LABEL_1" and pred["score"] > threshold else 0
             )
         return pred_labels
+
+
+# Backward-compatible alias
+PromptClassifier = CorruptionClassifier
 
 
 class TokenClassifier(Classifier):

@@ -163,7 +163,7 @@ def _make_detector(
     Parameters
     ----------
     classifier_predict_fn : callable | None
-        Replacement for ``PromptClassifier.predict``.  Receives
+        Replacement for ``CorruptionClassifier.predict``.  Receives
         ``(sentences, threshold)`` and returns a list of 0/1 labels.
         Defaults to flagging everything.
     nli_fn : callable | None
