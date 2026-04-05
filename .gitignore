@@ -164,6 +164,8 @@ cython_debug/
 *.zip
 *_classifier/
 *_classifiers/
+knowledge_banks/
+leak_detector_data/
 bbc_news_*/
 hp_book_*/
 Llama*/
@@ -178,3 +180,4 @@ CLAUDE.md
 
 # Local docs / notes
 docs/
+crash_traceback.txt

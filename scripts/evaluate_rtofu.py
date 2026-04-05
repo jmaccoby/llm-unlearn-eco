@@ -46,6 +46,11 @@ parser.add_argument("--repetition_penalty", type=float, default=None)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--eval_retain", action="store_true", help="Also evaluate on the matched retain split")
 parser.add_argument("--output_dir", type=str, default="results/rtofu")
+# Leak detector arguments
+parser.add_argument("--leak_classifier_path", type=str, default=None, help="Path to trained leak classifier (enables leak detection)")
+parser.add_argument("--knowledge_bank_dir", type=str, default=None, help="Path to knowledge bank directory")
+parser.add_argument("--leak_classifier_threshold", type=float, default=0.5)
+parser.add_argument("--leak_cosine_prefilter", type=float, default=0.3)
 args = parser.parse_args()
 
 seed_everything(args.seed)
@@ -145,6 +150,28 @@ all_results["AFE"] = compute_afe(all_results, forget_prefix)
 all_results["CFE"] = compute_cfe(all_results, forget_prefix)
 log_print(f"AFE: {all_results['AFE']:.4f}")
 log_print(f"CFE: {all_results['CFE']:.4f}")
+
+# Optional: run leak detection on generated CoTs
+if args.leak_classifier_path is not None:
+    from eco.attack.leak_detector import CoTLeakDetector
+
+    kb_dir = args.knowledge_bank_dir or f"knowledge_banks/{args.split}"
+    log_print(f"\nRunning leak detection (classifier={args.leak_classifier_path})")
+    leak_detector = CoTLeakDetector(
+        classifier_path=args.leak_classifier_path,
+        knowledge_bank_dir=kb_dir,
+        classifier_threshold=args.leak_classifier_threshold,
+        cosine_prefilter=args.leak_cosine_prefilter,
+    )
+
+    for key, cot_data in engine.cot_generations.items():
+        generated_cots = cot_data["generated"]
+        results_list = leak_detector.detect_batch(generated_cots)
+        n_leaking = sum(1 for r in results_list if r.is_leaking)
+        n_total = len(results_list)
+        leak_rate = n_leaking / n_total if n_total > 0 else 0.0
+        all_results[f"{key}_leak_rate"] = leak_rate
+        log_print(f"Leak rate ({key}): {n_leaking}/{n_total} = {leak_rate:.4f}")
 
 # Save results
 os.makedirs(args.output_dir, exist_ok=True)
