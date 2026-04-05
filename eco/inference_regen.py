@@ -1,0 +1,361 @@
+"""Regenerating generation engine for reasoning model unlearning.
+
+Extends ReasoningGenerationEngine with a detect-and-regenerate loop:
+after initial generation, checks each CoT for forget-set leakage and
+regenerates from the truncation point with prefix corruption and/or
+a learned soft token.
+"""
+
+import time
+
+import torch
+from tqdm import tqdm
+
+from eco.attack.model import AttackedModel
+from eco.attack.utils import build_prefix_corruption_mask
+from eco.evaluator.utils import split_sentences
+from eco.inference import ReasoningGenerationEngine, _remove_hooks
+from eco.model.reasoning import ReasoningModel
+from eco.utils import fix_bpe, log_print
+
+
+class RegeneratingReasoningEngine(ReasoningGenerationEngine):
+    """ReasoningGenerationEngine with post-generation leak detection and regeneration.
+
+    After initial generation, each CoT is checked for forget-set leakage.
+    Leaking samples are regenerated from the truncation point using prefix
+    corruption and/or a learned soft token, up to ``regen_max_attempts``.
+    """
+
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        data_module,
+        subset_names,
+        answer_evaluator,
+        cot_evaluator=None,
+        batch_size=64,
+        prompt_prefix="",
+        comparison_length=128,
+        truncate_answers=False,
+        # Regeneration parameters:
+        leak_detector=None,
+        regen_corrupt_mode="window",
+        regen_window=32,
+        regen_window_mode="sentences",
+        regen_max_attempts=3,
+        soft_token=None,
+    ):
+        super().__init__(
+            model=model,
+            tokenizer=tokenizer,
+            data_module=data_module,
+            subset_names=subset_names,
+            answer_evaluator=answer_evaluator,
+            cot_evaluator=cot_evaluator,
+            batch_size=batch_size,
+            prompt_prefix=prompt_prefix,
+            comparison_length=comparison_length,
+            truncate_answers=truncate_answers,
+        )
+        self.leak_detector = leak_detector
+        self.regen_corrupt_mode = regen_corrupt_mode
+        self.regen_window = regen_window
+        self.regen_window_mode = regen_window_mode
+        self.regen_max_attempts = regen_max_attempts
+        self.soft_token = soft_token
+
+    def _generate(self):
+        self.prepare_dataset()
+        padding_side = self.tokenizer.padding_side
+        if self.tokenizer.padding_side != "left":
+            self.tokenizer.padding_side = "left"
+
+        n_think = getattr(self.model, "n_think_tokens", 0)
+
+        subsets_generations = {}
+        for subset_name, dataset in self.datasets.items():
+            all_gold_answers, all_gold_cots, all_generated_answers = [], [], []
+            all_generated_cot, all_generated_answer = [], []
+            all_prompts = []
+            total_time, total_examples = 0, 0
+
+            for batch in tqdm(
+                dataset,
+                desc=f"Generating completions of {self.data_module.name} on {subset_name}",
+                total=len(dataset),
+            ):
+                _remove_hooks(self.model)
+                prompts = batch[self.data_module.gen_prompt_key]
+                gold_answers = batch[self.data_module.gen_answer_key]
+
+                tokenized_prompts = self.tokenizer(
+                    prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=256,
+                ).to(self.model.device)
+
+                decode_start = tokenized_prompts["input_ids"].shape[1] + n_think
+
+                start_time = time.perf_counter()
+                generated = self.model.generate(
+                    **tokenized_prompts,
+                    prompts=prompts,
+                    generation_config=self.model.generation_config,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+                end_time = time.perf_counter()
+                total_time += end_time - start_time
+                total_examples += len(prompts)
+
+                # Decode only new tokens (after prompt + think prefix), apply BPE fix
+                batch_responses = []
+                for i in range(generated.shape[0]):
+                    raw = self.tokenizer.decode(
+                        generated[i][decode_start:], skip_special_tokens=True
+                    )
+                    batch_responses.append(fix_bpe(raw))
+
+                # Split into CoT and answer at </think>\n\n
+                batch_cot, batch_answer = [], []
+                for resp in batch_responses:
+                    if self.THINK_SUFFIX in resp:
+                        cot, answer = resp.split(self.THINK_SUFFIX, 1)
+                        batch_cot.append(cot)
+                        batch_answer.append(answer)
+                    else:
+                        batch_cot.append(resp)
+                        batch_answer.append("")
+
+                gold_cots = batch.get(
+                    getattr(self.data_module, "gen_cot_key", None),
+                    [""] * len(prompts),
+                )
+
+                # ----------------------------------------------------------
+                # Phase 2: Leak detection + regeneration
+                # ----------------------------------------------------------
+                if self.leak_detector is not None:
+                    results = self.leak_detector.detect_batch(batch_cot)
+
+                    for sample_idx, result in enumerate(results):
+                        if not result.is_leaking:
+                            continue
+
+                        first_leak_index = result.first_leak_index
+                        clean_prefix = " ".join(
+                            result.sentences[:first_leak_index]
+                        )
+
+                        prompt = prompts[sample_idx]
+
+                        for attempt in range(self.regen_max_attempts):
+                            regen_cot, regen_answer = self._regenerate_sample(
+                                prompt, clean_prefix, attempt
+                            )
+
+                            # Re-run leak detection on regenerated CoT
+                            new_result = self.leak_detector.detect(regen_cot)
+
+                            if not new_result.is_leaking:
+                                log_print(
+                                    f"  Regeneration succeeded on attempt {attempt + 1}"
+                                )
+                                break
+
+                            # Update clean prefix if leak moved
+                            if (
+                                new_result.first_leak_index is not None
+                                and new_result.first_leak_index != first_leak_index
+                            ):
+                                first_leak_index = new_result.first_leak_index
+                                clean_prefix = " ".join(
+                                    new_result.sentences[:first_leak_index]
+                                )
+                            # Otherwise: same leak point, escalate window on next attempt
+                        else:
+                            log_print(
+                                f"  Regeneration exhausted {self.regen_max_attempts} attempts"
+                            )
+
+                        batch_cot[sample_idx] = regen_cot
+                        batch_answer[sample_idx] = regen_answer
+
+                all_gold_answers.append(gold_answers)
+                all_gold_cots.append(gold_cots)
+                all_generated_answers.append(batch_responses)
+                all_generated_cot.append(batch_cot)
+                all_generated_answer.append(batch_answer)
+                all_prompts.append(prompts)
+                _remove_hooks(self.model)
+
+            subsets_generations[subset_name] = {
+                "prompt": all_prompts,
+                "gold_answer": all_gold_answers,
+                "gold_cot": all_gold_cots,
+                "generated": all_generated_answers,
+                "generated_cot": all_generated_cot,
+                "generated_answer": all_generated_answer,
+            }
+
+        self.tokenizer.padding_side = padding_side
+        return subsets_generations
+
+    # ------------------------------------------------------------------
+    # Single-sample regeneration
+    # ------------------------------------------------------------------
+
+    def _regenerate_sample(self, prompt, clean_prefix, attempt):
+        """Regenerate a single sample from its clean prefix.
+
+        Returns (cot, answer) strings.
+        """
+        think_prefix = ReasoningModel.THINK_PREFIX
+        extended_text = prompt + think_prefix + clean_prefix
+
+        # Tokenize the extended input with left-padding
+        extended_tok = self.tokenizer(
+            [extended_text],
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=2048,
+        ).to(self.model.device)
+
+        input_ids = extended_tok["input_ids"]
+        attention_mask = extended_tok["attention_mask"]
+        total_len = input_ids.shape[1]
+
+        # Compute token boundaries
+        prompt_tok = self.tokenizer(
+            prompt, add_special_tokens=True, return_tensors="pt"
+        )
+        prompt_len = prompt_tok["input_ids"].shape[1]
+        think_len = self.model.n_think_tokens
+        prefix_token_len = total_len - prompt_len - think_len
+
+        # Build corruption mask and optionally prepare soft token
+        mask, input_ids, attention_mask, st_handle = self._build_regen_corruption(
+            prompt_len, think_len, prefix_token_len, clean_prefix,
+            attempt, input_ids, attention_mask,
+        )
+
+        # Unwrap ReasoningModel to get AttackedModel (think prefix is already
+        # in the input, so we bypass ReasoningModel.generate())
+        inner = self.model._inner
+
+        try:
+            generated = inner.generate_with_mask(
+                mask,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                generation_config=self.model.generation_config,
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+        finally:
+            # Clean up soft token hook if one was registered
+            if st_handle is not None:
+                st_handle.remove()
+
+        # Decode new tokens from the full extended input length
+        decode_start = input_ids.shape[1]
+        raw = self.tokenizer.decode(
+            generated[0][decode_start:], skip_special_tokens=True
+        )
+        text = fix_bpe(raw)
+
+        # Prepend the clean prefix to the newly generated continuation
+        if clean_prefix:
+            full_cot_text = clean_prefix + " " + text
+        else:
+            full_cot_text = text
+
+        # Split at </think>\n\n
+        if self.THINK_SUFFIX in full_cot_text:
+            cot, answer = full_cot_text.split(self.THINK_SUFFIX, 1)
+        else:
+            cot = full_cot_text
+            answer = ""
+
+        return cot, answer
+
+    def _build_regen_corruption(
+        self, prompt_len, think_len, prefix_token_len, clean_prefix,
+        attempt, input_ids, attention_mask,
+    ):
+        """Build the corruption mask and optional soft token hook for regeneration.
+
+        Returns (mask, input_ids, attention_mask, st_handle).
+        st_handle is None if no soft token is used.
+        """
+        st_handle = None
+        mode = self.regen_corrupt_mode
+
+        # Compute window size based on mode and attempt escalation
+        window_size = self._compute_window_size(
+            clean_prefix, prefix_token_len, attempt
+        )
+
+        uses_window = mode in ("window", "window+soft_token")
+        uses_soft_token = mode in ("soft_token", "window+soft_token")
+
+        if uses_soft_token:
+            # Append a pad token for the soft token to replace
+            pad_id = self.tokenizer.pad_token_id
+            pad_token = torch.tensor(
+                [[pad_id]], device=input_ids.device, dtype=input_ids.dtype
+            )
+            input_ids = torch.cat([input_ids, pad_token], dim=1)
+            attention_mask = torch.cat(
+                [attention_mask, torch.ones(1, 1, device=attention_mask.device, dtype=attention_mask.dtype)],
+                dim=1,
+            )
+            # Soft token position is the last token (the appended pad)
+            st_position = input_ids.shape[1] - 1
+
+        if uses_window:
+            mask = build_prefix_corruption_mask(
+                prompt_len, think_len, prefix_token_len, window_size, batch_size=1
+            )
+            if uses_soft_token:
+                # Extend mask with a 0 for the appended pad token (soft token
+                # hook handles that position, not the corruption mask)
+                mask = [row + [0] for row in mask]
+        else:
+            # soft_token only: all-zeros mask (corruption handled by soft token hook)
+            total_len = input_ids.shape[1]
+            mask = [[0] * total_len]
+
+        if uses_soft_token:
+            inner = self.model._inner
+            st_handle = self.soft_token.apply_hook(inner.attack_module, st_position)
+
+        return mask, input_ids, attention_mask, st_handle
+
+    def _compute_window_size(self, clean_prefix, prefix_token_len, attempt):
+        """Compute the corruption window size, escalating with each attempt."""
+        if self.regen_window_mode == "sentences":
+            sentences = split_sentences(clean_prefix)
+            if not sentences:
+                return self.regen_window
+
+            # Sentence count escalates: 1, 2, 4, ... (doubling per attempt)
+            n_sentences = min(1 * (2 ** attempt), len(sentences))
+
+            # Take the last n_sentences from the prefix
+            window_sentences = sentences[-n_sentences:]
+            window_text = " ".join(window_sentences)
+
+            # Re-tokenize to get token count
+            window_tokens = self.tokenizer(
+                window_text, add_special_tokens=False
+            )["input_ids"]
+            return min(len(window_tokens), prefix_token_len)
+        else:
+            # Token mode: base window doubles each attempt
+            return min(self.regen_window * (2 ** attempt), prefix_token_len)
