@@ -162,6 +162,10 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
 
                         prompt = prompts[sample_idx]
 
+                        # Track best output: start with original, update on
+                        # each attempt.  The last attempt (strongest corruption)
+                        # is kept even if it still leaks — it's better than the
+                        # original which is guaranteed to leak.
                         best_cot = batch_cot[sample_idx]
                         best_answer = batch_answer[sample_idx]
 
@@ -169,12 +173,12 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
                             regen_cot, regen_answer = self._regenerate_sample(
                                 prompt, clean_prefix, attempt
                             )
+                            best_cot, best_answer = regen_cot, regen_answer
 
                             # Re-run leak detection on regenerated CoT
                             new_result = self.leak_detector.detect(regen_cot)
 
                             if not new_result.is_leaking:
-                                best_cot, best_answer = regen_cot, regen_answer
                                 log_print(
                                     f"  Regeneration succeeded on attempt {attempt + 1}"
                                 )
