@@ -73,6 +73,8 @@ parser.add_argument("--regen_window", type=int, default=32)
 parser.add_argument("--regen_window_mode", type=str, default="sentences", choices=["tokens", "sentences"])
 parser.add_argument("--regen_max_attempts", type=int, default=3)
 parser.add_argument("--soft_token_path", type=str, default=None, help="Path to trained soft token embedding")
+parser.add_argument("--soft_token_bank_path", type=str, default=None, help="Path to trained soft token bank (cluster mode)")
+parser.add_argument("--n_clusters", type=int, default=0, help="Number of clusters for soft token bank (0 = infer from state dict)")
 args = parser.parse_args()
 
 # Validate
@@ -80,10 +82,13 @@ if args.corrupt_method is None and args.regen_corrupt_mode is None:
     parser.error("At least one of --corrupt_method or --regen_corrupt_mode is required")
 if args.regen_corrupt_mode is not None and args.leak_classifier_path is None:
     parser.error("--regen_corrupt_mode requires --leak_classifier_path")
-if args.soft_token_path is not None and (
+if args.soft_token_path is not None and args.soft_token_bank_path is not None:
+    parser.error("--soft_token_path and --soft_token_bank_path are mutually exclusive")
+soft_token_arg = args.soft_token_path or args.soft_token_bank_path
+if soft_token_arg is not None and (
     args.regen_corrupt_mode is None or "soft_token" not in args.regen_corrupt_mode
 ):
-    parser.error("--soft_token_path requires --regen_corrupt_mode to be 'soft_token' or 'window+soft_token'")
+    parser.error("--soft_token_path/--soft_token_bank_path requires --regen_corrupt_mode to be 'soft_token' or 'window+soft_token'")
 
 # Resolve regen corruption config (fall back to prompt corruption values)
 regen_corrupt_method = args.regen_corrupt_method or args.corrupt_method
@@ -133,7 +138,18 @@ if needs_prompt_corruption or needs_regen_corruption:
             regen_corrupt_args["strength"] = regen_strength
 
     soft_token = None
-    if args.soft_token_path is not None:
+    if args.soft_token_bank_path is not None:
+        import torch
+        from eco.attack.soft_token import SoftTokenBank
+        embed_dim = model.model_config["embedding_dim"]
+        if args.n_clusters > 0:
+            n_clusters = args.n_clusters
+        else:
+            sd = torch.load(args.soft_token_bank_path, weights_only=True)
+            n_clusters = sum(1 for k in sd if k.endswith(".embedding"))
+        soft_token = SoftTokenBank.load(args.soft_token_bank_path, n_clusters=n_clusters, embed_dim=embed_dim)
+        log_print(f"Loaded soft token bank ({n_clusters} clusters) from {args.soft_token_bank_path}")
+    elif args.soft_token_path is not None:
         from eco.attack.soft_token import SoftToken
         soft_token = SoftToken.load(args.soft_token_path, embed_dim=model.model_config["embedding_dim"])
         log_print(f"Loaded soft token from {args.soft_token_path}")

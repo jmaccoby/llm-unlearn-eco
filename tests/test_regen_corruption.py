@@ -240,3 +240,73 @@ class TestRegenerate:
             mock_hook.assert_not_called()
             # Soft token hook should still be applied
             mock_soft_token.apply_hook.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# SoftTokenBank + cluster_id tests
+# ---------------------------------------------------------------------------
+
+class TestRegenerateWithClusterID:
+    def test_cluster_id_forwarded_to_bank(self):
+        """When soft_token is a SoftTokenBank, cluster_id is passed to apply_hook."""
+        from eco.attack.soft_token import SoftTokenBank
+
+        bank = SoftTokenBank(n_clusters=3, embed_dim=64)
+        mock_hook_handle = MagicMock()
+        bank.apply_hook = MagicMock(return_value=mock_hook_handle)
+
+        attacked = _make_attacked_model(soft_token=bank)
+
+        with patch("eco.attack.model.apply_corruption_hook") as mock_hook:
+            mock_hook.return_value = MagicMock()
+            attacked.regenerate(
+                [[0, 1]], soft_token_position=5, cluster_id=2,
+                input_ids=torch.tensor([[1, 2]]),
+            )
+            bank.apply_hook.assert_called_once_with(
+                attacked.attack_module, 5, 2
+            )
+            mock_hook_handle.remove.assert_called_once()
+
+    def test_plain_soft_token_ignores_cluster_id(self):
+        """A plain SoftToken ignores cluster_id without error."""
+        mock_soft_token = MagicMock(spec=["apply_hook"])
+        mock_st_handle = MagicMock()
+        mock_soft_token.apply_hook.return_value = mock_st_handle
+
+        attacked = _make_attacked_model(soft_token=mock_soft_token)
+
+        with patch("eco.attack.model.apply_corruption_hook") as mock_hook:
+            mock_hook.return_value = MagicMock()
+            # Passing cluster_id should not cause an error
+            attacked.regenerate(
+                [[0, 1]], soft_token_position=3, cluster_id=1,
+                input_ids=torch.tensor([[1, 2]]),
+            )
+            # apply_hook called without cluster_id since it's a plain SoftToken
+            mock_soft_token.apply_hook.assert_called_once_with(
+                attacked.attack_module, 3
+            )
+
+    def test_bank_without_cluster_id_falls_through(self):
+        """SoftTokenBank with cluster_id=None falls to the else branch."""
+        from eco.attack.soft_token import SoftTokenBank
+
+        bank = SoftTokenBank(n_clusters=2, embed_dim=64)
+        # When cluster_id is None, isinstance check fails the 'and',
+        # so it falls to the else branch which calls apply_hook(module, pos)
+        mock_handle = MagicMock()
+        bank.apply_hook = MagicMock(return_value=mock_handle)
+
+        attacked = _make_attacked_model(soft_token=bank)
+
+        with patch("eco.attack.model.apply_corruption_hook") as mock_hook:
+            mock_hook.return_value = MagicMock()
+            attacked.regenerate(
+                [[0, 1]], soft_token_position=2, cluster_id=None,
+                input_ids=torch.tensor([[1, 2]]),
+            )
+            # Falls to the else branch
+            bank.apply_hook.assert_called_once_with(
+                attacked.attack_module, 2
+            )

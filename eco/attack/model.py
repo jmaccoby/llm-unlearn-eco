@@ -1,3 +1,4 @@
+from eco.attack.soft_token import SoftTokenBank
 from eco.attack.utils import (
     apply_corruption_hook,
     apply_embeddings_extraction_hook,
@@ -79,7 +80,9 @@ class AttackedModel:
             self.apply_corruption(prompts)
         return self.model.generate(*args, **kwargs)
 
-    def regenerate(self, pos_mask, soft_token_position=None, **kwargs):
+    def regenerate(
+        self, pos_mask, soft_token_position=None, cluster_id=None, **kwargs
+    ):
         """Generate with CoT corruption using the regen config.
 
         Parameters
@@ -89,6 +92,9 @@ class AttackedModel:
         soft_token_position : int | None
             If set and a soft token is configured, its embedding replaces the
             token at this position during prefill.
+        cluster_id : int | None
+            If the soft token is a ``SoftTokenBank``, selects which
+            per-cluster token to apply.  Ignored for a plain ``SoftToken``.
         """
         if (
             "olmo" in self.model_name.lower()
@@ -106,9 +112,14 @@ class AttackedModel:
             )
         st_handle = None
         if self.soft_token is not None and soft_token_position is not None:
-            st_handle = self.soft_token.apply_hook(
-                self.attack_module, soft_token_position
-            )
+            if isinstance(self.soft_token, SoftTokenBank) and cluster_id is not None:
+                st_handle = self.soft_token.apply_hook(
+                    self.attack_module, soft_token_position, cluster_id
+                )
+            else:
+                st_handle = self.soft_token.apply_hook(
+                    self.attack_module, soft_token_position
+                )
         try:
             return self.model.generate(**kwargs)
         finally:

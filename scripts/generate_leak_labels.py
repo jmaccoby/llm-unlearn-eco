@@ -178,10 +178,11 @@ def generate_cots(dataset, desc="Generating"):
 
 def label_sentence(sentence: str) -> int:
     """Check if a sentence entails any knowledge bank claim. Returns 0 or 1."""
-    return int(entails_any_claim(
+    entailed, _ = entails_any_claim(
         sentence, claims, bank_embeddings, st_model, nli,
         cosine_prefilter=args.cosine_prefilter,
-    ))
+    )
+    return int(entailed)
 
 
 # -------------------------------------------------------------------------

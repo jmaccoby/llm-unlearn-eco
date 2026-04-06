@@ -56,6 +56,18 @@ log_print(f"Loading knowledge bank from {kb_dir}")
 claims, bank_embeddings = load_knowledge_bank(kb_dir)
 log_print(f"Knowledge bank: {len(claims)} claims")
 
+# Load cluster labels if available
+cluster_labels = None
+n_clusters = 0
+clusters_path = os.path.join(kb_dir, "claim_clusters.json")
+if os.path.exists(clusters_path):
+    from eco.attack.claim_cluster import load_clusters
+    cluster_labels, _ = load_clusters(kb_dir)
+    n_clusters = int(cluster_labels.max()) + 1
+    log_print(f"Loaded cluster labels: {n_clusters} clusters")
+else:
+    log_print("No cluster artifacts found; cluster_id will be omitted")
+
 # -------------------------------------------------------------------------
 # Load NLI resources
 # -------------------------------------------------------------------------
@@ -77,8 +89,11 @@ nli = pipeline(
 # -------------------------------------------------------------------------
 
 
-def sentence_is_leaking(sentence: str) -> bool:
-    """Check if a sentence entails any knowledge bank claim."""
+def sentence_is_leaking(sentence: str) -> tuple[bool, int | None]:
+    """Check if a sentence entails any knowledge bank claim.
+
+    Returns (is_leaking, matched_claim_index).
+    """
     return entails_any_claim(
         sentence, claims, bank_embeddings, st_model, nli,
         cosine_prefilter=args.cosine_prefilter,
@@ -99,19 +114,27 @@ for i, (prompt, cot) in enumerate(zip(forget_prompts, forget_cots)):
 
     # Find first leaking sentence
     first_leak_idx = None
+    matched_claim_idx = None
     for k, sentence in enumerate(sentences):
-        if sentence_is_leaking(sentence):
+        is_leaking, claim_idx = sentence_is_leaking(sentence)
+        if is_leaking:
             first_leak_idx = k
+            matched_claim_idx = claim_idx
             break
 
     if first_leak_idx is not None:
         prefix = " ".join(sentences[:first_leak_idx])
         leaking_continuation = " ".join(sentences[first_leak_idx:])
-        forget_triples.append({
+        triple = {
             "prompt": prompt,
             "prefix": prefix,
             "leaking_continuation": leaking_continuation,
-        })
+        }
+        if matched_claim_idx is not None:
+            triple["matched_claim_index"] = matched_claim_idx
+        if cluster_labels is not None and matched_claim_idx is not None:
+            triple["cluster_id"] = int(cluster_labels[matched_claim_idx])
+        forget_triples.append(triple)
 
     if (i + 1) % 20 == 0 or i == len(forget_cots) - 1:
         log_print(
@@ -120,6 +143,15 @@ for i, (prompt, cot) in enumerate(zip(forget_prompts, forget_cots)):
         )
 
 log_print(f"Forget triples: {len(forget_triples)}")
+
+if cluster_labels is not None:
+    from collections import Counter
+    cluster_counts = Counter(t.get("cluster_id") for t in forget_triples)
+    for cid in sorted(cluster_counts):
+        log_print(f"  Cluster {cid}: {cluster_counts[cid]} examples")
+    missing = set(range(n_clusters)) - set(cluster_counts)
+    if missing:
+        log_print(f"  Warning: clusters with no examples: {sorted(missing)}")
 
 if len(forget_triples) == 0:
     log_print("ERROR: No leaking sentences found. Cannot build training data.")

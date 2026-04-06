@@ -165,6 +165,7 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
                             continue
 
                         first_leak_index = result.first_leak_index
+                        cluster_id = result.matched_cluster_id
                         tried_index_zero = False
                         if first_leak_index == 0:
                             if "soft_token" not in self.regen_corrupt_mode:
@@ -194,7 +195,8 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
                         attempt = 0
                         while attempt < self.regen_max_attempts:
                             regen_cot, regen_answer = self._regenerate_sample(
-                                prompt, clean_prefix, attempt
+                                prompt, clean_prefix, attempt,
+                                cluster_id=cluster_id,
                             )
                             best_cot, best_answer = regen_cot, regen_answer
 
@@ -206,6 +208,17 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
                                     f"  Regeneration succeeded on attempt {attempt + 1}"
                                 )
                                 break
+
+                            # Update cluster_id if matched claim changed
+                            if (
+                                new_result.matched_cluster_id is not None
+                                and new_result.matched_cluster_id != cluster_id
+                            ):
+                                log_print(
+                                    f"  Cluster switched: {cluster_id} -> "
+                                    f"{new_result.matched_cluster_id}"
+                                )
+                                cluster_id = new_result.matched_cluster_id
 
                             # Update clean prefix if leak moved to a new
                             # actionable location.  Index 0 is only actionable
@@ -271,7 +284,7 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
     # Single-sample regeneration
     # ------------------------------------------------------------------
 
-    def _regenerate_sample(self, prompt, clean_prefix, attempt):
+    def _regenerate_sample(self, prompt, clean_prefix, attempt, cluster_id=None):
         """Regenerate a single sample from its clean prefix.
 
         Returns (cot, answer) strings.
@@ -311,6 +324,7 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
         generated = inner.regenerate(
             mask,
             soft_token_position=st_position,
+            cluster_id=cluster_id,
             input_ids=input_ids,
             attention_mask=attention_mask,
             generation_config=self.model.generation_config,

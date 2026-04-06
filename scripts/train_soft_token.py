@@ -1,11 +1,16 @@
 """
-Train a learned soft token for CoT truncation-point insertion.
+Train learned soft token(s) for CoT truncation-point insertion.
 
-Optimizes a single embedding vector to maximize cross-entropy on
-forget-set continuations while minimizing it on clean continuations.
+Optimizes embedding vector(s) to maximize cross-entropy on forget-set
+continuations while minimizing it on clean continuations.
+
+In ``single`` mode, trains one soft token for all examples (original
+behaviour).  In ``cluster`` mode, trains a bank of per-cluster soft
+tokens, each specialised to its claim cluster.
 
 Usage:
     python -m scripts.train_soft_token --split forget10 --epochs 100 --lr 1e-3
+    python -m scripts.train_soft_token --split forget10 --mode cluster --n_clusters 5
 """
 import argparse
 import json
@@ -15,7 +20,7 @@ import random
 import torch
 import torch.nn as nn
 
-from eco.attack.soft_token import SoftToken
+from eco.attack.soft_token import SoftToken, SoftTokenBank
 from eco.attack.utils import get_nested_attr, remove_hooks
 from eco.model import HFModel
 from eco.utils import log_print, seed_everything
@@ -35,6 +40,19 @@ parser.add_argument("--lambda_retain", type=float, default=0.1)
 parser.add_argument("--max_seq_len", type=int, default=512)
 parser.add_argument("--output_dir", type=str, default="soft_tokens")
 parser.add_argument("--seed", type=int, default=0)
+parser.add_argument(
+    "--mode",
+    type=str,
+    default="single",
+    choices=["single", "cluster"],
+    help="single: one soft token; cluster: one per claim cluster",
+)
+parser.add_argument(
+    "--n_clusters",
+    type=int,
+    default=0,
+    help="Number of clusters (cluster mode). 0 = infer from training data.",
+)
 args = parser.parse_args()
 
 seed_everything(args.seed)
@@ -78,16 +96,35 @@ with open(data_path) as f:
 log_print(f"Training examples: {len(training_examples)}")
 
 # -------------------------------------------------------------------------
-# Initialize soft token and optimizer
+# Initialize soft token(s) and optimizer
 # -------------------------------------------------------------------------
 
-soft_token = SoftToken(embed_dim=embed_dim).to(device)
-optimizer = torch.optim.Adam([soft_token.embedding], lr=args.lr)
+cluster_mode = args.mode == "cluster"
+
+if cluster_mode:
+    # Infer n_clusters from training data if not specified
+    n_clusters = args.n_clusters
+    if n_clusters == 0:
+        cluster_ids = {ex.get("cluster_id") for ex in training_examples}
+        cluster_ids.discard(None)
+        if not cluster_ids:
+            raise ValueError(
+                "cluster mode requires cluster_id in training data; "
+                "run build_soft_token_data.py with a clustered knowledge bank"
+            )
+        n_clusters = max(cluster_ids) + 1
+    soft_token_bank = SoftTokenBank(n_clusters=n_clusters, embed_dim=embed_dim).to(device)
+    optimizer = torch.optim.Adam(soft_token_bank.parameters(), lr=args.lr)
+    log_print(f"SoftTokenBank initialized ({n_clusters} clusters, dim={embed_dim})")
+else:
+    soft_token_bank = None
+    soft_token = SoftToken(embed_dim=embed_dim).to(device)
+    optimizer = torch.optim.Adam([soft_token.embedding], lr=args.lr)
+    log_print(f"Soft token initialized (dim={embed_dim})")
 
 THINK_PREFIX = "<think>\n"
 pad_token = tokenizer.pad_token or tokenizer.eos_token
 
-log_print(f"Soft token initialized (dim={embed_dim})")
 log_print(f"Optimizer: Adam, lr={args.lr}")
 log_print(f"Lambda retain: {args.lambda_retain}, Epochs: {args.epochs}")
 
@@ -200,6 +237,16 @@ for epoch in range(args.epochs):
         leaking_cont = example["leaking_continuation"]
         clean_cont = example["clean_continuation"]
 
+        # Select the appropriate soft token
+        if cluster_mode:
+            cluster_id = example.get("cluster_id")
+            if cluster_id is None:
+                continue  # skip examples without cluster annotation
+            active_token = soft_token_bank.select(cluster_id)
+        else:
+            cluster_id = None
+            active_token = soft_token
+
         # --- Forget loss: maximize CE on leaking continuation ---
         input_ids, attn_mask, st_pos, cont_start, cont_end = (
             tokenize_with_soft_token(prompt, prefix, leaking_cont)
@@ -208,7 +255,7 @@ for epoch in range(args.epochs):
         if cont_start >= cont_end:
             continue
 
-        hook_handle = soft_token.apply_hook(embed_module, st_pos)
+        hook_handle = active_token.apply_hook(embed_module, st_pos)
         l_forget = compute_masked_loss(input_ids, attn_mask, cont_start, cont_end)
         hook_handle.remove()
 
@@ -228,7 +275,7 @@ for epoch in range(args.epochs):
             n_examples += 1
             continue
 
-        hook_handle = soft_token.apply_hook(embed_module, st_pos)
+        hook_handle = active_token.apply_hook(embed_module, st_pos)
         l_retain = compute_masked_loss(input_ids, attn_mask, cont_start, cont_end)
         hook_handle.remove()
 
@@ -263,11 +310,17 @@ for epoch in range(args.epochs):
     )
 
 # -------------------------------------------------------------------------
-# Save trained soft token
+# Save trained soft token(s)
 # -------------------------------------------------------------------------
 
 output_path = f"{args.output_dir}/{args.split}"
 os.makedirs(output_path, exist_ok=True)
-save_path = f"{output_path}/embedding.pt"
-soft_token.save(save_path)
-log_print(f"\nSoft token saved to {save_path}")
+
+if cluster_mode:
+    save_path = f"{output_path}/soft_token_bank.pt"
+    soft_token_bank.save(save_path)
+    log_print(f"\nSoft token bank saved to {save_path}")
+else:
+    save_path = f"{output_path}/embedding.pt"
+    soft_token.save(save_path)
+    log_print(f"\nSoft token saved to {save_path}")

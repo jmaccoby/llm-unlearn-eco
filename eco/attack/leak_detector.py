@@ -37,6 +37,8 @@ class LeakDetectionResult:
     sentences: list[str]  # all CoT sentences
     stage1_flags: list[bool]  # per-sentence Stage 1 classifier flags
     confirmed_flags: list[bool]  # per-sentence Stage 2 entailment confirmations
+    matched_claim_index: int | None = None  # index into knowledge bank claims
+    matched_cluster_id: int | None = None  # cluster the matched claim belongs to
 
 
 # ------------------------------------------------------------------
@@ -102,11 +104,18 @@ def entails_any_claim(
     cosine_prefilter: float = 0.3,
     nli_batch_size: int = 16,
     top_k: int | None = None,
-) -> bool:
+) -> tuple[bool, int | None]:
     """Check if *text* entails any claim via cosine pre-filter + NLI.
 
     Standalone function used by both :class:`CoTLeakDetector` and the
     training data generation scripts to avoid duplicating the logic.
+
+    Returns
+    -------
+    (entailed, claim_index) : tuple[bool, int | None]
+        ``entailed`` is True if any claim is entailed.
+        ``claim_index`` is the index into *claims* of the first
+        entailed claim (or None if no entailment).
     """
     text_emb = st_model.encode(text, show_progress_bar=False)
     sims = cosine_similarity([text_emb], bank_embeddings)[0]
@@ -118,7 +127,7 @@ def entails_any_claim(
         candidate_indices = above[np.argsort(sims[above])[::-1]].tolist()
 
     if not candidate_indices:
-        return False
+        return False, None
 
     for batch_start in range(0, len(candidate_indices), nli_batch_size):
         batch_idx = candidate_indices[
@@ -126,10 +135,10 @@ def entails_any_claim(
         ]
         pairs = [{"text": text, "text_pair": claims[i]} for i in batch_idx]
         results = nli(pairs, truncation=True, max_length=512)
-        for result in results:
+        for j, result in enumerate(results):
             if result["label"].lower() == "entailment":
-                return True
-    return False
+                return True, batch_idx[j]
+    return False, None
 
 
 class CoTLeakDetector:
@@ -177,6 +186,13 @@ class CoTLeakDetector:
         # Stage 2 — knowledge bank + NLI
         self.claims, self.bank_embeddings = load_knowledge_bank(knowledge_bank_dir)
 
+        # Optional: load claim clusters for claim-specific soft tokens
+        self.cluster_labels = None
+        clusters_path = os.path.join(knowledge_bank_dir, "claim_clusters.json")
+        if os.path.exists(clusters_path):
+            from eco.attack.claim_cluster import load_clusters
+            self.cluster_labels, self._centroids = load_clusters(knowledge_bank_dir)
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.st_model = sentence_transformer or SentenceTransformer(
             "paraphrase-MiniLM-L6-v2",
@@ -194,6 +210,12 @@ class CoTLeakDetector:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def _claim_to_cluster(self, claim_index: int | None) -> int | None:
+        """Map a claim index to its cluster ID, or None."""
+        if claim_index is None or self.cluster_labels is None:
+            return None
+        return int(self.cluster_labels[claim_index])
 
     def detect(self, generated_cot: str) -> LeakDetectionResult:
         """Analyse a single generated CoT for forget-set leakage."""
@@ -227,7 +249,8 @@ class CoTLeakDetector:
 
         # --- Stage 2: entailment (document order, early stop) -------------
         for idx in flagged_indices:
-            if self._entails_any_claim(sentences[idx]):
+            entailed, claim_idx = self._entails_any_claim(sentences[idx])
+            if entailed:
                 confirmed_flags[idx] = True
                 return LeakDetectionResult(
                     is_leaking=True,
@@ -235,6 +258,8 @@ class CoTLeakDetector:
                     sentences=sentences,
                     stage1_flags=stage1_flags,
                     confirmed_flags=confirmed_flags,
+                    matched_claim_index=claim_idx,
+                    matched_cluster_id=self._claim_to_cluster(claim_idx),
                 )
 
         # --- Fallback: full-CoT check ------------------------------------
@@ -244,16 +269,20 @@ class CoTLeakDetector:
         # TODO: returns first_leak_index=0 which the regeneration engine
         # can't act on meaningfully (empty prefix → zero corruption window).
         # Re-integrate with proper handling in the regeneration engine.
-        if self.fallback_top_k > 0 and self._entails_any_claim(
-            generated_cot, top_k=self.fallback_top_k
-        ):
-            return LeakDetectionResult(
-                is_leaking=True,
-                first_leak_index=0,  # can't pinpoint; truncate from start
-                sentences=sentences,
-                stage1_flags=stage1_flags,
-                confirmed_flags=confirmed_flags,
+        if self.fallback_top_k > 0:
+            entailed, claim_idx = self._entails_any_claim(
+                generated_cot, top_k=self.fallback_top_k
             )
+            if entailed:
+                return LeakDetectionResult(
+                    is_leaking=True,
+                    first_leak_index=0,  # can't pinpoint; truncate from start
+                    sentences=sentences,
+                    stage1_flags=stage1_flags,
+                    confirmed_flags=confirmed_flags,
+                    matched_claim_index=claim_idx,
+                    matched_cluster_id=self._claim_to_cluster(claim_idx),
+                )
 
         # Stage 1 flags were false positives.
         return LeakDetectionResult(
@@ -274,7 +303,7 @@ class CoTLeakDetector:
 
     def _entails_any_claim(
         self, text: str, top_k: int | None = None
-    ) -> bool:
+    ) -> tuple[bool, int | None]:
         """Delegate to the module-level :func:`entails_any_claim`."""
         return entails_any_claim(
             text,

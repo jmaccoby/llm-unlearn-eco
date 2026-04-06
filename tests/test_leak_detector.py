@@ -203,6 +203,8 @@ def _make_detector(
     det.cosine_prefilter = cosine_prefilter
     det.nli_batch_size = 16
     det.fallback_top_k = fallback_top_k
+    det.cluster_labels = None
+    det._centroids = None
 
     return det
 
@@ -377,3 +379,125 @@ class TestDetectBatch:
         for br, ir in zip(batch_results, individual_results):
             assert br.is_leaking == ir.is_leaking
             assert br.first_leak_index == ir.first_leak_index
+
+
+# ---------------------------------------------------------------------------
+# entails_any_claim return value tests
+# ---------------------------------------------------------------------------
+
+
+class TestEntailsAnyClaim:
+    def test_returns_tuple(self, tmp_path):
+        from eco.attack.leak_detector import entails_any_claim
+
+        bank_dir = str(tmp_path / "bank")
+        _make_mock_bank(bank_dir)
+        claims, bank_embs = load_knowledge_bank(bank_dir)
+        st_model = FakeSTModel()
+        nli = MagicMock(
+            side_effect=lambda pairs, **kw: [
+                {"label": "entailment", "score": 0.99}
+            ] * len(pairs)
+        )
+
+        result = entails_any_claim(
+            LEAKING_SENTENCE_0, claims, bank_embs,
+            st_model, nli, cosine_prefilter=0.0,
+        )
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        entailed, claim_idx = result
+        assert entailed is True
+        assert isinstance(claim_idx, int)
+        assert 0 <= claim_idx < len(claims)
+
+    def test_returns_none_on_no_match(self, tmp_path):
+        from eco.attack.leak_detector import entails_any_claim
+
+        bank_dir = str(tmp_path / "bank")
+        _make_mock_bank(bank_dir)
+        claims, bank_embs = load_knowledge_bank(bank_dir)
+        st_model = FakeSTModel()
+        nli = MagicMock(
+            side_effect=lambda pairs, **kw: [
+                {"label": "neutral", "score": 0.5}
+            ] * len(pairs)
+        )
+
+        entailed, claim_idx = entails_any_claim(
+            CLEAN_SENTENCE, claims, bank_embs,
+            st_model, nli, cosine_prefilter=0.0,
+        )
+        assert entailed is False
+        assert claim_idx is None
+
+
+# ---------------------------------------------------------------------------
+# Matched claim index and cluster ID tests
+# ---------------------------------------------------------------------------
+
+
+class TestMatchedClaimFields:
+    def test_leaking_result_has_claim_index(self, tmp_path):
+        det = _make_detector(tmp_path)
+        cot = f"{CLEAN_SENTENCE} {LEAKING_SENTENCE_0}"
+        result = det.detect(cot)
+        assert result.is_leaking
+        assert result.matched_claim_index is not None
+        assert 0 <= result.matched_claim_index < len(MOCK_CLAIMS)
+
+    def test_clean_result_has_no_claim_index(self, tmp_path):
+        det = _make_detector(
+            tmp_path,
+            classifier_predict_fn=lambda sents, thr: [0] * len(sents),
+        )
+        result = det.detect(CLEAN_SENTENCE)
+        assert not result.is_leaking
+        assert result.matched_claim_index is None
+        assert result.matched_cluster_id is None
+
+    def test_cluster_id_populated_when_clusters_loaded(self, tmp_path):
+        det = _make_detector(tmp_path)
+        # Assign each of the 3 mock claims to a cluster
+        det.cluster_labels = np.array([0, 1, 0])
+
+        cot = f"{CLEAN_SENTENCE} {LEAKING_SENTENCE_0}"
+        result = det.detect(cot)
+        assert result.is_leaking
+        assert result.matched_cluster_id is not None
+        # cluster_id should match the claim's assignment
+        expected_cluster = det.cluster_labels[result.matched_claim_index]
+        assert result.matched_cluster_id == expected_cluster
+
+    def test_cluster_id_none_when_no_clusters(self, tmp_path):
+        det = _make_detector(tmp_path)
+        assert det.cluster_labels is None
+
+        cot = f"{CLEAN_SENTENCE} {LEAKING_SENTENCE_0}"
+        result = det.detect(cot)
+        assert result.is_leaking
+        assert result.matched_claim_index is not None
+        assert result.matched_cluster_id is None
+
+    def test_fallback_has_claim_index(self, tmp_path):
+        """Fallback full-CoT path should also return matched_claim_index."""
+        individual_sentences = set()
+
+        def nli_with_fallback(pairs, **kw):
+            results = []
+            for p in pairs:
+                if p["text"] in individual_sentences:
+                    results.append({"label": "neutral", "score": 0.6})
+                else:
+                    results.append({"label": "entailment", "score": 0.95})
+            return results
+
+        det = _make_detector(
+            tmp_path, nli_fn=nli_with_fallback, fallback_top_k=3
+        )
+        cot = f"{CLEAN_SENTENCE} {CLEAN_SENTENCE_2}"
+        individual_sentences.update(split_sentences(cot))
+        result = det.detect(cot)
+        assert result.is_leaking
+        assert result.first_leak_index == 0
+        assert result.matched_claim_index is not None
