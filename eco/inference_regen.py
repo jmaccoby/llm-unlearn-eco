@@ -165,18 +165,22 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
                             continue
 
                         first_leak_index = result.first_leak_index
+                        tried_index_zero = False
                         if first_leak_index == 0:
-                            # Fallback detected distributed leak but can't
-                            # pinpoint a sentence — no clean prefix to keep.
-                            # Skip regeneration for this sample.
-                            log_print(
-                                f"  Sample {sample_idx}: leak at index 0, "
-                                f"skipping regeneration (no clean prefix)"
+                            if "soft_token" not in self.regen_corrupt_mode:
+                                log_print(
+                                    f"  Sample {sample_idx}: leak at index 0, "
+                                    f"skipping regeneration (no clean prefix)"
+                                )
+                                continue
+                            # No clean prefix, but soft token can still
+                            # influence generation from after <think>\n.
+                            clean_prefix = ""
+                            tried_index_zero = True
+                        else:
+                            clean_prefix = " ".join(
+                                result.sentences[:first_leak_index]
                             )
-                            continue
-                        clean_prefix = " ".join(
-                            result.sentences[:first_leak_index]
-                        )
 
                         prompt = prompts[sample_idx]
 
@@ -203,18 +207,31 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
                                 )
                                 break
 
-                            # Update clean prefix if leak moved forward
-                            if (
+                            # Update clean prefix if leak moved to a new
+                            # actionable location.  Index 0 is only actionable
+                            # once (with soft token) — empty prefix means no
+                            # window escalation, so retries are identical.
+                            moved = (
                                 new_result.first_leak_index is not None
                                 and new_result.first_leak_index != first_leak_index
-                            ):
+                            )
+                            can_use = moved and (
+                                new_result.first_leak_index != 0
+                                or (
+                                    "soft_token" in self.regen_corrupt_mode
+                                    and not tried_index_zero
+                                )
+                            )
+                            if can_use:
                                 first_leak_index = new_result.first_leak_index
                                 clean_prefix = " ".join(
                                     new_result.sentences[:first_leak_index]
                                 )
+                                if first_leak_index == 0:
+                                    tried_index_zero = True
                                 attempt = 0  # new location — reset escalation
                             else:
-                                attempt += 1  # same leak point — escalate window
+                                attempt += 1  # same or non-actionable — escalate
                         else:
                             log_print(
                                 f"  Regeneration exhausted {self.regen_max_attempts} attempts"
