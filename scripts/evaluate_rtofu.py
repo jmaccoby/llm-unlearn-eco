@@ -59,6 +59,11 @@ parser.add_argument("--regen_window", type=int, default=32)
 parser.add_argument("--regen_window_mode", type=str, default="sentences", choices=["tokens", "sentences"])
 parser.add_argument("--regen_max_attempts", type=int, default=3)
 parser.add_argument("--soft_token_path", type=str, default=None, help="Path to trained soft token embedding")
+# Regeneration corruption (independent of prompt corruption)
+parser.add_argument("--regen_corrupt_method", type=str, default=None,
+                    help="Corruption method for CoT regeneration (default: same as --corrupt_method)")
+parser.add_argument("--regen_dims", type=int, default=None, help="Embedding dims for regen corruption (default: same as --dims)")
+parser.add_argument("--regen_strength", type=float, default=None, help="Noise strength for regen corruption (default: same as --strength)")
 args = parser.parse_args()
 
 # Validate argument combinations
@@ -68,6 +73,19 @@ if args.soft_token_path is not None and (
     args.regen_corrupt_mode is None or "soft_token" not in args.regen_corrupt_mode
 ):
     parser.error("--soft_token_path requires --regen_corrupt_mode to be 'soft_token' or 'window+soft_token'")
+
+# Resolve regen corruption config (fall back to prompt corruption values)
+regen_corrupt_method = args.regen_corrupt_method or args.corrupt_method
+regen_dims = args.regen_dims if args.regen_dims is not None else args.dims
+regen_strength = args.regen_strength if args.regen_strength is not None else args.strength
+if args.regen_corrupt_mode is not None and regen_corrupt_method is None:
+    parser.error(
+        "--regen_corrupt_mode requires either --regen_corrupt_method or --corrupt_method"
+    )
+if regen_corrupt_method is not None and regen_dims is None:
+    parser.error(
+        "Regen corruption requires --regen_dims or --dims"
+    )
 
 seed_everything(args.seed)
 
@@ -87,17 +105,38 @@ model = HFModel(
     generation_config=generation_config,
 )
 
-# Optionally wrap with corruption
-if args.corrupt_method is not None:
-    log_print(f"Loading prompt classifier: rtofu_classifiers/{args.split}")
-    prompt_classifier = PromptClassifier(
-        model_name="roberta-base",
-        model_path=f"rtofu_classifiers/{args.split}",
-        batch_size=args.batch_size,
-    )
-    corrupt_args = {"dims": args.dims}
-    if args.strength is not None:
-        corrupt_args["strength"] = args.strength
+# Optionally wrap with corruption (prompt and/or regen)
+needs_prompt_corruption = args.corrupt_method is not None
+needs_regen_corruption = args.regen_corrupt_mode is not None
+if needs_prompt_corruption or needs_regen_corruption:
+    # Prompt corruption components (optional)
+    prompt_classifier = None
+    corrupt_args = None
+    if needs_prompt_corruption:
+        log_print(f"Loading prompt classifier: rtofu_classifiers/{args.split}")
+        prompt_classifier = PromptClassifier(
+            model_name="roberta-base",
+            model_path=f"rtofu_classifiers/{args.split}",
+            batch_size=args.batch_size,
+        )
+        corrupt_args = {"dims": args.dims}
+        if args.strength is not None:
+            corrupt_args["strength"] = args.strength
+
+    # Regen corruption args
+    regen_corrupt_args = None
+    if needs_regen_corruption:
+        regen_corrupt_args = {"dims": regen_dims}
+        if regen_strength is not None:
+            regen_corrupt_args["strength"] = regen_strength
+
+    # Soft token
+    soft_token = None
+    if args.soft_token_path is not None:
+        from eco.attack.soft_token import SoftToken
+        soft_token = SoftToken.load(args.soft_token_path, embed_dim=model.model_config["embedding_dim"])
+        log_print(f"Loaded soft token from {args.soft_token_path}")
+
     model = AttackedModel(
         model=model,
         prompt_classifier=prompt_classifier,
@@ -105,6 +144,9 @@ if args.corrupt_method is not None:
         corrupt_method=args.corrupt_method,
         corrupt_args=corrupt_args,
         classifier_threshold=args.classifier_threshold,
+        regen_corrupt_method=regen_corrupt_method,
+        regen_corrupt_args=regen_corrupt_args,
+        soft_token=soft_token,
     )
 
 model = ReasoningModel(model)
@@ -146,7 +188,6 @@ cot_evaluators = [
 # Run generation + evaluation
 if args.regen_corrupt_mode is not None:  # validation ensures leak_classifier_path is set
     from eco.attack.leak_detector import CoTLeakDetector
-    from eco.attack.soft_token import SoftToken
     from eco.inference_regen import RegeneratingReasoningEngine
 
     kb_dir = args.knowledge_bank_dir or f"knowledge_banks/{args.split}"
@@ -156,10 +197,6 @@ if args.regen_corrupt_mode is not None:  # validation ensures leak_classifier_pa
         classifier_threshold=args.leak_classifier_threshold,
         cosine_prefilter=args.leak_cosine_prefilter,
     )
-    soft_token = None
-    if args.soft_token_path is not None:
-        soft_token = SoftToken.load(args.soft_token_path, embed_dim=model.model_config["embedding_dim"])
-        log_print(f"Loaded soft token from {args.soft_token_path}")
 
     engine = RegeneratingReasoningEngine(
         model=model,
@@ -174,7 +211,6 @@ if args.regen_corrupt_mode is not None:  # validation ensures leak_classifier_pa
         regen_window=args.regen_window,
         regen_window_mode=args.regen_window_mode,
         regen_max_attempts=args.regen_max_attempts,
-        soft_token=soft_token,
     )
     log_print(f"Regeneration enabled: mode={args.regen_corrupt_mode}, max_attempts={args.regen_max_attempts}")
 else:
@@ -233,7 +269,7 @@ run_name = "_".join(
         f"dims={args.dims}" if args.dims else None,
         f"str={args.strength}" if args.strength else None,
         f"regen={args.regen_corrupt_mode}" if args.regen_corrupt_mode else None,
-        f"w={args.regen_window}" if args.regen_corrupt_mode else None,
+        f"w={args.regen_window}" if args.regen_corrupt_mode and "window" in args.regen_corrupt_mode else None,
         f"att={args.regen_max_attempts}" if args.regen_corrupt_mode else None,
     ])
 )

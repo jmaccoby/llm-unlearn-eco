@@ -11,7 +11,6 @@ import time
 import torch
 from tqdm import tqdm
 
-from eco.attack.model import AttackedModel
 from eco.attack.utils import build_prefix_corruption_mask
 from eco.evaluator.utils import split_sentences
 from eco.inference import ReasoningGenerationEngine, _remove_hooks
@@ -25,6 +24,10 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
     After initial generation, each CoT is checked for forget-set leakage.
     Leaking samples are regenerated from the truncation point using prefix
     corruption and/or a learned soft token, up to ``regen_max_attempts``.
+
+    CoT corruption config (method, args, soft token) lives on the
+    ``AttackedModel`` and is invoked via its ``regenerate()`` method,
+    fully decoupled from prompt corruption.
     """
 
     def __init__(
@@ -45,7 +48,6 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
         regen_window=32,
         regen_window_mode="sentences",
         regen_max_attempts=3,
-        soft_token=None,
     ):
         super().__init__(
             model=model,
@@ -63,17 +65,24 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
             raise ValueError(
                 f"Unknown regen_corrupt_mode: {regen_corrupt_mode!r}"
             )
-        if "soft_token" in regen_corrupt_mode and soft_token is None:
-            raise ValueError(
-                f"regen_corrupt_mode={regen_corrupt_mode!r} requires "
-                f"soft_token to be provided"
+        # Validate that the inner model supports regeneration
+        inner = model._inner if isinstance(model, ReasoningModel) else model
+        if leak_detector is not None and not hasattr(inner, "regenerate"):
+            raise TypeError(
+                f"Regeneration requires a model with regenerate() "
+                f"(e.g. AttackedModel), got {type(inner).__name__}"
             )
+        if "soft_token" in regen_corrupt_mode:
+            if not hasattr(inner, "soft_token") or inner.soft_token is None:
+                raise ValueError(
+                    f"regen_corrupt_mode={regen_corrupt_mode!r} requires "
+                    f"the model to have a soft_token configured"
+                )
         self.leak_detector = leak_detector
         self.regen_corrupt_mode = regen_corrupt_mode
         self.regen_window = regen_window
         self.regen_window_mode = regen_window_mode
         self.regen_max_attempts = regen_max_attempts
-        self.soft_token = soft_token
 
     def _generate(self):
         self.prepare_dataset()
@@ -178,7 +187,8 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
                         best_cot = batch_cot[sample_idx]
                         best_answer = batch_answer[sample_idx]
 
-                        for attempt in range(self.regen_max_attempts):
+                        attempt = 0
+                        while attempt < self.regen_max_attempts:
                             regen_cot, regen_answer = self._regenerate_sample(
                                 prompt, clean_prefix, attempt
                             )
@@ -193,7 +203,7 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
                                 )
                                 break
 
-                            # Update clean prefix if leak moved
+                            # Update clean prefix if leak moved forward
                             if (
                                 new_result.first_leak_index is not None
                                 and new_result.first_leak_index != first_leak_index
@@ -202,7 +212,9 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
                                 clean_prefix = " ".join(
                                     new_result.sentences[:first_leak_index]
                                 )
-                            # Otherwise: same leak point, escalate window on next attempt
+                                attempt = 0  # new location — reset escalation
+                            else:
+                                attempt += 1  # same leak point — escalate window
                         else:
                             log_print(
                                 f"  Regeneration exhausted {self.regen_max_attempts} attempts"
@@ -269,8 +281,8 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
         input_ids = torch.tensor([all_ids], device=self.model.device)
         attention_mask = torch.ones_like(input_ids)
 
-        # Build corruption mask and optionally prepare soft token
-        mask, input_ids, attention_mask, st_handle = self._build_regen_corruption(
+        # Build corruption mask and optionally extend input for soft token
+        mask, input_ids, attention_mask, st_position = self._build_regen_corruption(
             prompt_len, think_len, prefix_token_len, clean_prefix,
             attempt, input_ids, attention_mask,
         )
@@ -278,25 +290,16 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
         # Unwrap ReasoningModel to get AttackedModel (think prefix is already
         # in the input, so we bypass ReasoningModel.generate())
         inner = self.model._inner
-        if not hasattr(inner, "generate_with_mask"):
-            raise TypeError(
-                f"Regeneration requires a model with generate_with_mask() "
-                f"(e.g. AttackedModel), got {type(inner).__name__}"
-            )
 
-        try:
-            generated = inner.generate_with_mask(
-                mask,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                generation_config=self.model.generation_config,
-                eos_token_id=self.tokenizer.eos_token_id,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-        finally:
-            # Clean up soft token hook if one was registered
-            if st_handle is not None:
-                st_handle.remove()
+        generated = inner.regenerate(
+            mask,
+            soft_token_position=st_position,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            generation_config=self.model.generation_config,
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
 
         # Decode new tokens from the full extended input length
         decode_start = input_ids.shape[1]
@@ -324,12 +327,12 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
         self, prompt_len, think_len, prefix_token_len, clean_prefix,
         attempt, input_ids, attention_mask,
     ):
-        """Build the corruption mask and optional soft token hook for regeneration.
+        """Build the corruption mask and optionally extend input for soft token.
 
-        Returns (mask, input_ids, attention_mask, st_handle).
-        st_handle is None if no soft token is used.
+        Returns (mask, input_ids, attention_mask, st_position).
+        st_position is None if no soft token is used.
         """
-        st_handle = None
+        st_position = None
         mode = self.regen_corrupt_mode
 
         # Compute window size based on mode and attempt escalation
@@ -367,11 +370,7 @@ class RegeneratingReasoningEngine(ReasoningGenerationEngine):
             total_len = input_ids.shape[1]
             mask = [[0] * total_len]
 
-        if uses_soft_token:
-            inner = self.model._inner
-            st_handle = self.soft_token.apply_hook(inner.attack_module, st_position)
-
-        return mask, input_ids, attention_mask, st_handle
+        return mask, input_ids, attention_mask, st_position
 
     def _compute_window_size(self, clean_prefix, prefix_token_len, attempt):
         """Compute the corruption window size, escalating with each attempt."""

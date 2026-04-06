@@ -11,11 +11,16 @@ class AttackedModel:
     def __init__(
         self,
         model,
-        prompt_classifier,
-        token_classifier,
-        corrupt_method,
-        corrupt_args,
+        # Prompt corruption (all optional)
+        prompt_classifier=None,
+        token_classifier=None,
+        corrupt_method=None,
+        corrupt_args=None,
         classifier_threshold=0.5,
+        # CoT regeneration corruption (optional)
+        regen_corrupt_method=None,
+        regen_corrupt_args=None,
+        soft_token=None,
     ):
         self.model_name = model.model_name
         self.model = model.model
@@ -25,12 +30,17 @@ class AttackedModel:
         self.prompt_classifier = prompt_classifier
         self.token_classifier = token_classifier
         self.corrupt_method = corrupt_method
-        self.corrupt_args = remove_none_values(corrupt_args)
+        self.corrupt_args = remove_none_values(corrupt_args) if corrupt_args else {}
         self.attack_module = get_nested_attr(
             model.model, model.model_config["attack_module"]
         )
         self.classifier_threshold = classifier_threshold
         self.generation_config = model.generation_config
+        self.regen_corrupt_method = regen_corrupt_method
+        self.regen_corrupt_args = (
+            remove_none_values(regen_corrupt_args) if regen_corrupt_args else {}
+        )
+        self.soft_token = soft_token
         self.embeddings_data = []
         self._hook_handles = []
 
@@ -49,7 +59,8 @@ class AttackedModel:
         ):
             kwargs.pop("token_type_ids", None)
         self.remove_hooks()
-        self.apply_corruption(prompts, answers)
+        if self.corrupt_method is not None:
+            self.apply_corruption(prompts, answers)
         return self.model(*args, **kwargs)
 
     def update_corrupt_args(self, corrupt_args):
@@ -64,16 +75,20 @@ class AttackedModel:
         ):
             kwargs.pop("token_type_ids", None)
         self.remove_hooks()
-        self.apply_corruption(prompts)
+        if self.corrupt_method is not None:
+            self.apply_corruption(prompts)
         return self.model.generate(*args, **kwargs)
 
-    def generate_with_mask(self, pos_mask, *args, **kwargs):
-        """Generate with a custom corruption mask (skips classifiers).
+    def regenerate(self, pos_mask, soft_token_position=None, **kwargs):
+        """Generate with CoT corruption using the regen config.
 
         Parameters
         ----------
         pos_mask : list[list[int]]
             Per-batch, per-token binary mask. 1 = corrupt, 0 = leave clean.
+        soft_token_position : int | None
+            If set and a soft token is configured, its embedding replaces the
+            token at this position during prefill.
         """
         if (
             "olmo" in self.model_name.lower()
@@ -82,13 +97,25 @@ class AttackedModel:
         ):
             kwargs.pop("token_type_ids", None)
         self.remove_hooks()
-        corrupt_args = self.corrupt_args.copy()
-        corrupt_args["pos"] = pos_mask
-        handle = apply_corruption_hook(
-            self.attack_module, self.corrupt_method, corrupt_args
-        )
-        self._hook_handles.append(handle)
-        return self.model.generate(*args, **kwargs)
+        corrupt_handle = None
+        if self.regen_corrupt_method is not None:
+            corrupt_args = self.regen_corrupt_args.copy()
+            corrupt_args["pos"] = pos_mask
+            corrupt_handle = apply_corruption_hook(
+                self.attack_module, self.regen_corrupt_method, corrupt_args
+            )
+        st_handle = None
+        if self.soft_token is not None and soft_token_position is not None:
+            st_handle = self.soft_token.apply_hook(
+                self.attack_module, soft_token_position
+            )
+        try:
+            return self.model.generate(**kwargs)
+        finally:
+            if corrupt_handle is not None:
+                corrupt_handle.remove()
+            if st_handle is not None:
+                st_handle.remove()
 
     def apply_corruption(self, prompt, answers=None):
         if self.prompt_classifier is not None:

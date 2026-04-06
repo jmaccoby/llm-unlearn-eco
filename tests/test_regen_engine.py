@@ -59,6 +59,22 @@ class DummyModel:
             max_new_tokens=64,
             use_cache=False,
         )
+        # AttackedModel compatibility
+        self._hook_handles = []
+        self.attack_module = self.model
+        self.regen_corrupt_method = "rand_noise_first_n"
+        self.regen_corrupt_args = {"dims": 4, "strength": 1.0}
+        self.soft_token = None
+
+    def remove_hooks(self):
+        for h in self._hook_handles:
+            h.remove()
+        self._hook_handles.clear()
+
+    def regenerate(self, pos_mask, soft_token_position=None, **kwargs):
+        """Matches AttackedModel.regenerate interface."""
+        self.remove_hooks()
+        return self.generate(**kwargs)
 
     def generate(self, *args, **kwargs):
         kwargs.pop("prompts", None)
@@ -116,9 +132,12 @@ class LeakingDummyModel:
         self.leaking_cot = leaking_cot
         self.clean_cot = clean_cot
         self.call_count = 0
-        # Track for AttackedModel compatibility
+        # AttackedModel compatibility
         self._hook_handles = []
         self.attack_module = self.model
+        self.regen_corrupt_method = "rand_noise_first_n"
+        self.regen_corrupt_args = {"dims": 4, "strength": 1.0}
+        self.soft_token = None
 
     def remove_hooks(self):
         for h in self._hook_handles:
@@ -155,14 +174,18 @@ class LeakingDummyModel:
         ]
         return torch.tensor(padded)
 
-    def generate_with_mask(self, pos_mask, *args, **kwargs):
-        """Matches AttackedModel.generate_with_mask interface."""
+    def regenerate(self, pos_mask, soft_token_position=None, **kwargs):
+        """Matches AttackedModel.regenerate interface."""
         self.remove_hooks()
-        return self.generate(*args, **kwargs)
+        return self.generate(**kwargs)
 
 
 class AlwaysLeakingDummyModel(LeakingDummyModel):
-    """Always produces leaking output, regardless of call count."""
+    """Always produces leaking output, regardless of call count.
+
+    Overrides generate() so that every call returns the leaking CoT.
+    Inherits regenerate() from LeakingDummyModel which delegates to generate().
+    """
 
     def generate(self, *args, **kwargs):
         kwargs.pop("prompts", None)
@@ -389,6 +412,99 @@ class TestMaxAttemptsRespected:
 
         # 1 initial generate call + max_attempts regeneration calls
         assert inner.call_count == 1 + max_attempts
+
+
+class TestSoftTokenMode:
+    """When regen_corrupt_mode includes soft_token, the engine passes st_position."""
+
+    def setup_method(self):
+        self.tokenizer = _make_tokenizer()
+        self.rtofu = _make_rtofu(self.tokenizer)
+        for split in ["forget10", "retain90"]:
+            self.rtofu.dataset[split] = self.rtofu.dataset[split].select(range(1))
+
+    def test_soft_token_position_passed(self):
+        """regenerate() receives a non-None soft_token_position in soft_token mode."""
+        from unittest.mock import MagicMock
+
+        inner = LeakingDummyModel(
+            self.tokenizer,
+            leaking_cot="Safe start. The secret fact is revealed. More secrets here.",
+            clean_cot="I think carefully about this.",
+        )
+        inner.soft_token = MagicMock()  # Engine validates soft_token is not None
+
+        # Wrap the real regenerate to capture calls
+        original_regenerate = inner.regenerate
+        calls = []
+
+        def tracking_regenerate(pos_mask, soft_token_position=None, **kwargs):
+            calls.append(soft_token_position)
+            return original_regenerate(pos_mask, soft_token_position=soft_token_position, **kwargs)
+
+        inner.regenerate = tracking_regenerate
+        model = ReasoningModel(inner)
+
+        detector = MockLeakDetector(leak_on_calls={0}, first_leak_index=1)
+
+        engine = RegeneratingReasoningEngine(
+            model=model,
+            tokenizer=self.tokenizer,
+            data_module=self.rtofu,
+            subset_names=["forget10"],
+            answer_evaluator=[ROUGERecall(mode="rougeL")],
+            leak_detector=detector,
+            regen_corrupt_mode="window+soft_token",
+            regen_window=8,
+            regen_window_mode="tokens",
+            regen_max_attempts=3,
+            batch_size=1,
+        )
+        engine.inference()
+
+        # regenerate was called with a non-None soft_token_position
+        assert len(calls) >= 1
+        assert all(pos is not None for pos in calls)
+
+    def test_window_only_no_soft_token_position(self):
+        """In window-only mode, soft_token_position is None."""
+        from unittest.mock import MagicMock
+
+        inner = LeakingDummyModel(
+            self.tokenizer,
+            leaking_cot="Safe start. The secret fact is revealed. More secrets here.",
+            clean_cot="I think carefully about this.",
+        )
+
+        original_regenerate = inner.regenerate
+        calls = []
+
+        def tracking_regenerate(pos_mask, soft_token_position=None, **kwargs):
+            calls.append(soft_token_position)
+            return original_regenerate(pos_mask, soft_token_position=soft_token_position, **kwargs)
+
+        inner.regenerate = tracking_regenerate
+        model = ReasoningModel(inner)
+
+        detector = MockLeakDetector(leak_on_calls={0}, first_leak_index=1)
+
+        engine = RegeneratingReasoningEngine(
+            model=model,
+            tokenizer=self.tokenizer,
+            data_module=self.rtofu,
+            subset_names=["forget10"],
+            answer_evaluator=[ROUGERecall(mode="rougeL")],
+            leak_detector=detector,
+            regen_corrupt_mode="window",
+            regen_window=8,
+            regen_window_mode="tokens",
+            regen_max_attempts=3,
+            batch_size=1,
+        )
+        engine.inference()
+
+        assert len(calls) >= 1
+        assert all(pos is None for pos in calls)
 
 
 class TestNoDetectorSkipsRegen:

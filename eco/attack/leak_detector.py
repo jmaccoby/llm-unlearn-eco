@@ -164,7 +164,7 @@ class CoTLeakDetector:
         cosine_prefilter: float = 0.3,
         sentence_transformer: SentenceTransformer | None = None,
         nli_batch_size: int = 16,
-        fallback_top_k: int = 10,
+        fallback_top_k: int = 0,
     ):
         # Stage 1 — sentence classifier
         self.classifier = CorruptionClassifier(
@@ -241,7 +241,9 @@ class CoTLeakDetector:
         # Stage 1 flagged sentences but none were individually confirmed.
         # Check the full CoT against the top-k most similar claims to catch
         # distributed leaks spread across multiple sentences.
-        # (fallback_top_k=0 disables this check.)
+        # TODO: returns first_leak_index=0 which the regeneration engine
+        # can't act on meaningfully (empty prefix → zero corruption window).
+        # Re-integrate with proper handling in the regeneration engine.
         if self.fallback_top_k > 0 and self._entails_any_claim(
             generated_cot, top_k=self.fallback_top_k
         ):
