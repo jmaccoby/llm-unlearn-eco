@@ -78,9 +78,9 @@ if args.soft_token_path is not None and (
 regen_corrupt_method = args.regen_corrupt_method or args.corrupt_method
 regen_dims = args.regen_dims if args.regen_dims is not None else args.dims
 regen_strength = args.regen_strength if args.regen_strength is not None else args.strength
-if args.regen_corrupt_mode is not None and regen_corrupt_method is None:
+if args.regen_corrupt_mode is not None and "window" in args.regen_corrupt_mode and regen_corrupt_method is None:
     parser.error(
-        "--regen_corrupt_mode requires either --regen_corrupt_method or --corrupt_method"
+        "Window regen mode requires either --regen_corrupt_method or --corrupt_method"
     )
 if regen_corrupt_method is not None and regen_dims is None:
     parser.error(
