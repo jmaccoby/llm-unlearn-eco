@@ -57,14 +57,6 @@ def _make_mock_bank(tmp_dir):
     return tmp_dir
 
 
-def _make_classifier_dir(tmp_dir):
-    """Create a minimal fake classifier directory.
-
-    The actual model is monkey-patched, so only the path needs to exist.
-    """
-    os.makedirs(tmp_dir, exist_ok=True)
-    return tmp_dir
-
 
 class FakeSTModel:
     """Fake SentenceTransformer that returns deterministic embeddings.
@@ -154,11 +146,10 @@ class TestKnowledgeBankIO:
 def _make_detector(
     tmp_path,
     classifier_predict_fn=None,
-    nli_fn=None,
-    cosine_prefilter=0.0,
-    fallback_top_k=3,
+    projection_confirm_fn=None,
+    fallback=True,
 ):
-    """Build a CoTLeakDetector with mocked classifier and NLI models.
+    """Build a CoTLeakDetector with mocked classifier and projection.
 
     Parameters
     ----------
@@ -166,16 +157,11 @@ def _make_detector(
         Replacement for ``CorruptionClassifier.predict``.  Receives
         ``(sentences, threshold)`` and returns a list of 0/1 labels.
         Defaults to flagging everything.
-    nli_fn : callable | None
-        Replacement for the NLI pipeline ``__call__``.  Receives a list
-        of dicts and returns a list of ``{"label": ..., "score": ...}``.
-        Defaults to always returning "entailment".
+    projection_confirm_fn : callable | None
+        Replacement for ``_projection_confirms``.  Receives ``text``
+        and returns ``(confirmed: bool, cluster_id: int | None)``.
+        Defaults to always confirming with cluster_id=0.
     """
-    bank_dir = str(tmp_path / "bank")
-    _make_mock_bank(bank_dir)
-    classifier_dir = str(tmp_path / "clf")
-    _make_classifier_dir(classifier_dir)
-
     # Build the detector with mocks injected via patches.
     with patch.object(
         CoTLeakDetector, "__init__", lambda self, *a, **kw: None
@@ -188,23 +174,11 @@ def _make_detector(
         lambda sents, thr: [1] * len(sents)
     )
     det.classifier_threshold = 0.5
+    det.fallback = fallback
 
-    claims, bank_embs = load_knowledge_bank(bank_dir)
-    det.claims = claims
-    det.bank_embeddings = bank_embs
-
-    det.st_model = FakeSTModel()
-
-    det.nli = MagicMock()
-    det.nli.side_effect = nli_fn or (
-        lambda pairs, **kw: [{"label": "entailment", "score": 0.99}] * len(pairs)
-    )
-
-    det.cosine_prefilter = cosine_prefilter
-    det.nli_batch_size = 16
-    det.fallback_top_k = fallback_top_k
-    det.cluster_labels = None
-    det._centroids = None
+    # Mock projection — override _projection_confirms directly
+    confirm_fn = projection_confirm_fn or (lambda text: (True, 0))
+    det._projection_confirms = confirm_fn
 
     return det
 
@@ -219,20 +193,24 @@ class TestDetectBasic:
 
     def test_clean_cot_no_stage1_flags(self, tmp_path):
         """Stage 1 flags nothing → no leak, Stage 2 never runs."""
-        nli_mock = MagicMock()
+        projection_called = False
+
+        def tracking_projection(text):
+            nonlocal projection_called
+            projection_called = True
+            return True, 0
 
         det = _make_detector(
             tmp_path,
             classifier_predict_fn=lambda sents, thr: [0] * len(sents),
-            nli_fn=nli_mock,
+            projection_confirm_fn=tracking_projection,
         )
         result = det.detect(
             f"{CLEAN_SENTENCE} {CLEAN_SENTENCE_2}"
         )
         assert not result.is_leaking
         assert all(not f for f in result.stage1_flags)
-        # NLI should not have been called at all.
-        nli_mock.assert_not_called()
+        assert not projection_called
 
     def test_leaking_sentence_detected(self, tmp_path):
         det = _make_detector(tmp_path)
@@ -251,34 +229,33 @@ class TestDetectBasic:
 
 
 class TestEarlyStop:
-    def test_stage2_stops_at_first_entailment(self, tmp_path):
-        """Stage 2 should stop after the first confirmed entailment."""
-        nli_call_count = 0
+    def test_stage2_stops_at_first_confirmation(self, tmp_path):
+        """Stage 2 should stop after the first confirmed projection."""
+        projection_call_count = 0
 
-        def counting_nli(pairs, **kw):
-            nonlocal nli_call_count
-            nli_call_count += 1
-            return [{"label": "entailment", "score": 0.99}] * len(pairs)
+        def counting_projection(text):
+            nonlocal projection_call_count
+            projection_call_count += 1
+            return True, 0
 
-        det = _make_detector(tmp_path, nli_fn=counting_nli)
+        det = _make_detector(tmp_path, projection_confirm_fn=counting_projection)
         # Three sentences, all flagged by Stage 1.
         cot = f"{LEAKING_SENTENCE_0} {LEAKING_SENTENCE_1} {CLEAN_SENTENCE}"
         result = det.detect(cot)
         assert result.is_leaking
         assert result.first_leak_index == 0
-        # NLI was called once (for the first sentence, which entails).
-        # It should NOT have been called for later sentences.
-        assert nli_call_count == 1
+        # Projection was called once (for the first sentence, which confirmed).
+        assert projection_call_count == 1
 
 
 class TestStage1Filtering:
     def test_only_flagged_sentences_reach_stage2(self, tmp_path):
-        """Stage 2 NLI should only be called for Stage-1-flagged sentences."""
-        nli_texts_seen = []
+        """Stage 2 projection should only be called for flagged sentences."""
+        projection_texts_seen = []
 
-        def tracking_nli(pairs, **kw):
-            nli_texts_seen.extend(p["text"] for p in pairs)
-            return [{"label": "entailment", "score": 0.99}] * len(pairs)
+        def tracking_projection(text):
+            projection_texts_seen.append(text)
+            return True, 0
 
         # Only flag the second sentence.
         def selective_classifier(sents, thr):
@@ -287,22 +264,20 @@ class TestStage1Filtering:
         det = _make_detector(
             tmp_path,
             classifier_predict_fn=selective_classifier,
-            nli_fn=tracking_nli,
+            projection_confirm_fn=tracking_projection,
         )
         cot = f"{CLEAN_SENTENCE} {LEAKING_SENTENCE_0}"
         det.detect(cot)
 
-        # The clean sentence should NOT have been sent to NLI.
-        assert CLEAN_SENTENCE not in nli_texts_seen
+        # The clean sentence should NOT have been sent to projection.
+        assert CLEAN_SENTENCE not in projection_texts_seen
 
     def test_stage1_false_positive_rejected_by_stage2(self, tmp_path):
-        """Stage 1 flags a sentence but NLI does not confirm → no leak."""
+        """Stage 1 flags a sentence but projection does not confirm → no leak."""
         det = _make_detector(
             tmp_path,
-            nli_fn=lambda pairs, **kw: [
-                {"label": "neutral", "score": 0.8}
-            ] * len(pairs),
-            fallback_top_k=0,  # disable fallback so only per-sentence check
+            projection_confirm_fn=lambda text: (False, None),
+            fallback=False,
         )
         result = det.detect(f"{CLEAN_SENTENCE} {CLEAN_SENTENCE_2}")
         assert not result.is_leaking
@@ -316,25 +291,20 @@ class TestFallback:
         individual_sentences = set()
         call_count = {"individual": 0, "fallback": 0}
 
-        def nli_with_fallback(pairs, **kw):
-            results = []
-            for p in pairs:
-                # Distinguish individual sentences from the full CoT by
-                # checking if the text matches a known single sentence.
-                if p["text"] in individual_sentences:
-                    results.append({"label": "neutral", "score": 0.6})
-                    call_count["individual"] += 1
-                else:
-                    # Full CoT contains multiple sentences → entailment
-                    results.append({"label": "entailment", "score": 0.95})
-                    call_count["fallback"] += 1
-            return results
+        def projection_with_fallback(text):
+            if text in individual_sentences:
+                call_count["individual"] += 1
+                return False, None
+            else:
+                # Full CoT contains multiple sentences → confirmed
+                call_count["fallback"] += 1
+                return True, 0
 
         det = _make_detector(
-            tmp_path, nli_fn=nli_with_fallback, fallback_top_k=3
+            tmp_path,
+            projection_confirm_fn=projection_with_fallback,
+            fallback=True,
         )
-        # Two short clean sentences — individually neutral, but together
-        # the mock NLI says entailment (simulating distributed leak).
         cot = f"{CLEAN_SENTENCE} {CLEAN_SENTENCE_2}"
         individual_sentences.update(split_sentences(cot))
         result = det.detect(cot)
@@ -342,26 +312,15 @@ class TestFallback:
         assert result.first_leak_index == 0  # can't pinpoint
         assert call_count["fallback"] > 0
 
-
-class TestCosinePrefilter:
-    def test_high_prefilter_reduces_nli_calls(self, tmp_path):
-        """Setting a very high cosine threshold should eliminate NLI calls."""
-        nli_mock = MagicMock(
-            side_effect=lambda pairs, **kw: [
-                {"label": "entailment", "score": 0.99}
-            ] * len(pairs)
-        )
+    def test_fallback_disabled(self, tmp_path):
+        """When fallback is disabled, unconfirmed flags → no leak."""
         det = _make_detector(
             tmp_path,
-            nli_fn=nli_mock,
-            cosine_prefilter=0.9999,  # impossibly high
-            fallback_top_k=0,  # disable fallback
+            projection_confirm_fn=lambda text: (False, None),
+            fallback=False,
         )
-        result = det.detect(f"{LEAKING_SENTENCE_0} {CLEAN_SENTENCE}")
-        # With such a high threshold, no claims pass the pre-filter,
-        # so NLI is never called and nothing is confirmed.
+        result = det.detect(f"{CLEAN_SENTENCE} {CLEAN_SENTENCE_2}")
         assert not result.is_leaking
-        nli_mock.assert_not_called()
 
 
 class TestDetectBatch:
@@ -437,67 +396,44 @@ class TestEntailsAnyClaim:
 # ---------------------------------------------------------------------------
 
 
-class TestMatchedClaimFields:
-    def test_leaking_result_has_claim_index(self, tmp_path):
-        det = _make_detector(tmp_path)
+class TestMatchedClusterFields:
+    def test_leaking_result_has_cluster_id(self, tmp_path):
+        det = _make_detector(
+            tmp_path,
+            projection_confirm_fn=lambda text: (True, 2),
+        )
         cot = f"{CLEAN_SENTENCE} {LEAKING_SENTENCE_0}"
         result = det.detect(cot)
         assert result.is_leaking
-        assert result.matched_claim_index is not None
-        assert 0 <= result.matched_claim_index < len(MOCK_CLAIMS)
+        assert result.matched_cluster_id == 2
 
-    def test_clean_result_has_no_claim_index(self, tmp_path):
+    def test_clean_result_has_no_cluster_id(self, tmp_path):
         det = _make_detector(
             tmp_path,
             classifier_predict_fn=lambda sents, thr: [0] * len(sents),
         )
         result = det.detect(CLEAN_SENTENCE)
         assert not result.is_leaking
-        assert result.matched_claim_index is None
         assert result.matched_cluster_id is None
 
-    def test_cluster_id_populated_when_clusters_loaded(self, tmp_path):
-        det = _make_detector(tmp_path)
-        # Assign each of the 3 mock claims to a cluster
-        det.cluster_labels = np.array([0, 1, 0])
-
-        cot = f"{CLEAN_SENTENCE} {LEAKING_SENTENCE_0}"
-        result = det.detect(cot)
-        assert result.is_leaking
-        assert result.matched_cluster_id is not None
-        # cluster_id should match the claim's assignment
-        expected_cluster = det.cluster_labels[result.matched_claim_index]
-        assert result.matched_cluster_id == expected_cluster
-
-    def test_cluster_id_none_when_no_clusters(self, tmp_path):
-        det = _make_detector(tmp_path)
-        assert det.cluster_labels is None
-
-        cot = f"{CLEAN_SENTENCE} {LEAKING_SENTENCE_0}"
-        result = det.detect(cot)
-        assert result.is_leaking
-        assert result.matched_claim_index is not None
-        assert result.matched_cluster_id is None
-
-    def test_fallback_has_claim_index(self, tmp_path):
-        """Fallback full-CoT path should also return matched_claim_index."""
+    def test_fallback_has_cluster_id(self, tmp_path):
+        """Fallback full-CoT path should also return cluster_id."""
         individual_sentences = set()
 
-        def nli_with_fallback(pairs, **kw):
-            results = []
-            for p in pairs:
-                if p["text"] in individual_sentences:
-                    results.append({"label": "neutral", "score": 0.6})
-                else:
-                    results.append({"label": "entailment", "score": 0.95})
-            return results
+        def projection_with_fallback(text):
+            if text in individual_sentences:
+                return False, None
+            else:
+                return True, 5
 
         det = _make_detector(
-            tmp_path, nli_fn=nli_with_fallback, fallback_top_k=3
+            tmp_path,
+            projection_confirm_fn=projection_with_fallback,
+            fallback=True,
         )
         cot = f"{CLEAN_SENTENCE} {CLEAN_SENTENCE_2}"
         individual_sentences.update(split_sentences(cot))
         result = det.detect(cot)
         assert result.is_leaking
         assert result.first_leak_index == 0
-        assert result.matched_claim_index is not None
+        assert result.matched_cluster_id == 5

@@ -13,14 +13,14 @@ Usage:
         --regen_corrupt_mode window --regen_window_mode sentences \
         --regen_corrupt_method rand_noise_first_n --regen_dims 500 --regen_strength 50 \
         --leak_classifier_path leak_classifiers/forget10 \
-        --knowledge_bank_dir knowledge_banks/forget10 --show_cot
+        --projection_head_path projection_heads/forget10/projection_head.pt --show_cot
 
     # Both prompt corruption and regeneration
     python -m scripts.examine_rtofu_corrupted --split forget10 --num_examples 4 \
         --corrupt_method rand_noise_first_n --dims 500 --strength 50 \
         --regen_corrupt_mode window --regen_window_mode sentences \
         --leak_classifier_path leak_classifiers/forget10 \
-        --knowledge_bank_dir knowledge_banks/forget10 --show_cot
+        --projection_head_path projection_heads/forget10/projection_head.pt --show_cot
 """
 import argparse
 import csv
@@ -58,9 +58,10 @@ parser.add_argument("--classifier_threshold", type=float, default=0.99, help="Pr
 parser.add_argument("--repetition_penalty", type=float, default=None, help="Repetition penalty for generation")
 # Leak detector
 parser.add_argument("--leak_classifier_path", type=str, default=None, help="Path to trained leak classifier")
-parser.add_argument("--knowledge_bank_dir", type=str, default=None, help="Path to knowledge bank directory")
+parser.add_argument("--projection_head_path", type=str, default=None, help="Path to trained projection head for Stage 2")
 parser.add_argument("--leak_classifier_threshold", type=float, default=0.5)
-parser.add_argument("--leak_cosine_prefilter", type=float, default=0.3)
+parser.add_argument("--projection_threshold", type=float, default=0.5)
+parser.add_argument("--no_fallback", action="store_true", help="Disable full-CoT fallback in leak detector")
 # Regeneration
 parser.add_argument("--regen_corrupt_mode", type=str, default=None,
                     choices=["window", "soft_token", "window+soft_token"],
@@ -82,6 +83,8 @@ if args.corrupt_method is None and args.regen_corrupt_mode is None:
     parser.error("At least one of --corrupt_method or --regen_corrupt_mode is required")
 if args.regen_corrupt_mode is not None and args.leak_classifier_path is None:
     parser.error("--regen_corrupt_mode requires --leak_classifier_path")
+if args.leak_classifier_path is not None and args.projection_head_path is None:
+    parser.error("--leak_classifier_path requires --projection_head_path")
 if args.soft_token_path is not None and args.soft_token_bank_path is not None:
     parser.error("--soft_token_path and --soft_token_bank_path are mutually exclusive")
 soft_token_arg = args.soft_token_path or args.soft_token_bank_path
@@ -140,7 +143,7 @@ if needs_prompt_corruption or needs_regen_corruption:
     soft_token = None
     if args.soft_token_bank_path is not None:
         import torch
-        from eco.attack.soft_token import SoftTokenBank
+        from eco.attack.learned_hooks import SoftTokenBank
         embed_dim = model.model_config["embedding_dim"]
         if args.n_clusters > 0:
             n_clusters = args.n_clusters
@@ -150,7 +153,7 @@ if needs_prompt_corruption or needs_regen_corruption:
         soft_token = SoftTokenBank.load(args.soft_token_bank_path, n_clusters=n_clusters, embed_dim=embed_dim)
         log_print(f"Loaded soft token bank ({n_clusters} clusters) from {args.soft_token_bank_path}")
     elif args.soft_token_path is not None:
-        from eco.attack.soft_token import SoftToken
+        from eco.attack.learned_hooks import SoftToken
         soft_token = SoftToken.load(args.soft_token_path, embed_dim=model.model_config["embedding_dim"])
         log_print(f"Loaded soft token from {args.soft_token_path}")
 
@@ -186,12 +189,12 @@ if args.regen_corrupt_mode is not None:
     from eco.attack.leak_detector import CoTLeakDetector
     from eco.inference_regen import RegeneratingReasoningEngine
 
-    kb_dir = args.knowledge_bank_dir or f"knowledge_banks/{args.split}"
     leak_detector = CoTLeakDetector(
         classifier_path=args.leak_classifier_path,
-        knowledge_bank_dir=kb_dir,
+        projection_head_path=args.projection_head_path,
         classifier_threshold=args.leak_classifier_threshold,
-        cosine_prefilter=args.leak_cosine_prefilter,
+        projection_threshold=args.projection_threshold,
+        fallback=not args.no_fallback,
     )
     engine = RegeneratingReasoningEngine(
         model=model,

@@ -8,7 +8,7 @@ Usage:
 import torch
 import torch.nn as nn
 
-from eco.attack.soft_token import SoftToken, SoftTokenBank
+from eco.attack.learned_hooks import SoftToken, SoftTokenBank
 
 
 def test_init_shape():

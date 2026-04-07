@@ -249,7 +249,7 @@ class TestRegenerate:
 class TestRegenerateWithClusterID:
     def test_cluster_id_forwarded_to_bank(self):
         """When soft_token is a SoftTokenBank, cluster_id is passed to apply_hook."""
-        from eco.attack.soft_token import SoftTokenBank
+        from eco.attack.learned_hooks import SoftTokenBank
 
         bank = SoftTokenBank(n_clusters=3, embed_dim=64)
         mock_hook_handle = MagicMock()
@@ -290,7 +290,7 @@ class TestRegenerateWithClusterID:
 
     def test_bank_without_cluster_id_falls_through(self):
         """SoftTokenBank with cluster_id=None falls to the else branch."""
-        from eco.attack.soft_token import SoftTokenBank
+        from eco.attack.learned_hooks import SoftTokenBank
 
         bank = SoftTokenBank(n_clusters=2, embed_dim=64)
         # When cluster_id is None, isinstance check fails the 'and',

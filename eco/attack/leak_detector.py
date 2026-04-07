@@ -2,12 +2,16 @@
 
 Stage 1: A trained sentence classifier (RoBERTa) screens each CoT sentence
          for forget-set knowledge.  Fast — single forward pass per sentence.
-Stage 2: For flagged sentences (in document order), entailment is checked
-         against a precomputed knowledge bank of forget-set claims.  Stops
-         at the first confirmed entailment.
+Stage 2: A contrastive projection head maps flagged sentence embeddings
+         into claim-cluster centroid space.  A sentence is confirmed as a
+         leak if its projected embedding has high cosine similarity to any
+         cluster centroid.
 
-Both the classifier and the knowledge bank are precomputed from the forget
-set at setup time.  No per-prompt gold data is needed at inference.
+No plain-text forget-set data is needed at inference — only precomputed
+embeddings and trained model weights.
+
+The module-level ``entails_any_claim`` function is retained for offline
+labeling scripts that run at training time with access to plain-text claims.
 """
 
 import dataclasses
@@ -17,10 +21,9 @@ import os
 import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-from transformers import pipeline
 
 from eco.attack.classifier import CorruptionClassifier
+from eco.attack.learned_hooks import ProjectionHead
 from eco.evaluator.utils import split_sentences
 
 
@@ -37,7 +40,7 @@ class LeakDetectionResult:
     sentences: list[str]  # all CoT sentences
     stage1_flags: list[bool]  # per-sentence Stage 1 classifier flags
     confirmed_flags: list[bool]  # per-sentence Stage 2 entailment confirmations
-    matched_claim_index: int | None = None  # index into knowledge bank claims
+    matched_claim_index: int | None = None  # only set by offline labeling scripts
     matched_cluster_id: int | None = None  # cluster the matched claim belongs to
 
 
@@ -117,6 +120,8 @@ def entails_any_claim(
         ``claim_index`` is the index into *claims* of the first
         entailed claim (or None if no entailment).
     """
+    from sklearn.metrics.pairwise import cosine_similarity
+
     text_emb = st_model.encode(text, show_progress_bar=False)
     sims = cosine_similarity([text_emb], bank_embeddings)[0]
 
@@ -144,36 +149,38 @@ def entails_any_claim(
 class CoTLeakDetector:
     """Two-stage CoT leak detector.
 
+    Stage 1 screens every sentence with a fast RoBERTa classifier.
+    Stage 2 confirms flagged sentences by projecting their embeddings
+    into claim-cluster centroid space and checking cosine proximity.
+
     Parameters
     ----------
     classifier_path : str
         Path to the trained Stage 1 RoBERTa classifier checkpoint.
-    knowledge_bank_dir : str
-        Directory containing ``claims.json`` and ``embeddings.npy``.
+    projection_head_path : str
+        Path to the trained Stage 2 projection head (saved by
+        ``scripts/train_projection.py``).
     classifier_threshold : float
         Confidence threshold for the Stage 1 classifier.
-    cosine_prefilter : float
-        Minimum cosine similarity for a claim to be considered as an
-        NLI candidate in Stage 2.
+    projection_threshold : float
+        Minimum cosine similarity to a cluster centroid for Stage 2
+        confirmation.
     sentence_transformer : SentenceTransformer | None
         Optional pre-loaded model.  Avoids loading a second copy when
         evaluators already have one.
-    nli_batch_size : int
-        Batch size for the NLI pipeline.
-    fallback_top_k : int
-        Number of top-similarity claims to check in the full-CoT
-        fallback when no individual sentence is confirmed.
+    fallback : bool
+        If True, run the full CoT through the projection when no
+        individual sentence is confirmed (catches distributed leaks).
     """
 
     def __init__(
         self,
         classifier_path: str,
-        knowledge_bank_dir: str,
+        projection_head_path: str,
         classifier_threshold: float = 0.5,
-        cosine_prefilter: float = 0.3,
+        projection_threshold: float = 0.5,
         sentence_transformer: SentenceTransformer | None = None,
-        nli_batch_size: int = 16,
-        fallback_top_k: int = 0,
+        fallback: bool = True,
     ):
         # Stage 1 — sentence classifier
         self.classifier = CorruptionClassifier(
@@ -183,39 +190,23 @@ class CoTLeakDetector:
         )
         self.classifier_threshold = classifier_threshold
 
-        # Stage 2 — knowledge bank + NLI
-        self.claims, self.bank_embeddings = load_knowledge_bank(knowledge_bank_dir)
+        # Stage 2 — contrastive projection
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.projection_head, self.target_centroids = ProjectionHead.load(
+            projection_head_path, device=self.device
+        )
+        self.projection_head.eval()
+        self.projection_threshold = projection_threshold
+        self.fallback = fallback
 
-        # Optional: load claim clusters for claim-specific soft tokens
-        self.cluster_labels = None
-        clusters_path = os.path.join(knowledge_bank_dir, "claim_clusters.json")
-        if os.path.exists(clusters_path):
-            from eco.attack.claim_cluster import load_clusters
-            self.cluster_labels, self._centroids = load_clusters(knowledge_bank_dir)
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.st_model = sentence_transformer or SentenceTransformer(
             "paraphrase-MiniLM-L6-v2",
-            device=device,  # type: ignore[arg-type]
+            device=self.device,  # type: ignore[arg-type]
         )
-        self.nli = pipeline(
-            "text-classification",
-            model="sileod/deberta-v3-base-tasksource-nli",
-            device=device,
-        )
-        self.cosine_prefilter = cosine_prefilter
-        self.nli_batch_size = nli_batch_size
-        self.fallback_top_k = fallback_top_k
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-
-    def _claim_to_cluster(self, claim_index: int | None) -> int | None:
-        """Map a claim index to its cluster ID, or None."""
-        if claim_index is None or self.cluster_labels is None:
-            return None
-        return int(self.cluster_labels[claim_index])
 
     def detect(self, generated_cot: str) -> LeakDetectionResult:
         """Analyse a single generated CoT for forget-set leakage."""
@@ -247,10 +238,10 @@ class CoTLeakDetector:
                 confirmed_flags=confirmed_flags,
             )
 
-        # --- Stage 2: entailment (document order, early stop) -------------
+        # --- Stage 2: projection confirmation (document order, early stop) -
         for idx in flagged_indices:
-            entailed, claim_idx = self._entails_any_claim(sentences[idx])
-            if entailed:
+            confirmed, cluster_id = self._projection_confirms(sentences[idx])
+            if confirmed:
                 confirmed_flags[idx] = True
                 return LeakDetectionResult(
                     is_leaking=True,
@@ -258,30 +249,22 @@ class CoTLeakDetector:
                     sentences=sentences,
                     stage1_flags=stage1_flags,
                     confirmed_flags=confirmed_flags,
-                    matched_claim_index=claim_idx,
-                    matched_cluster_id=self._claim_to_cluster(claim_idx),
+                    matched_cluster_id=cluster_id,
                 )
 
-        # --- Fallback: full-CoT check ------------------------------------
-        # Stage 1 flagged sentences but none were individually confirmed.
-        # Check the full CoT against the top-k most similar claims to catch
-        # distributed leaks spread across multiple sentences.
-        # TODO: returns first_leak_index=0 which the regeneration engine
-        # can't act on meaningfully (empty prefix → zero corruption window).
-        # Re-integrate with proper handling in the regeneration engine.
-        if self.fallback_top_k > 0:
-            entailed, claim_idx = self._entails_any_claim(
-                generated_cot, top_k=self.fallback_top_k
-            )
-            if entailed:
+        # --- Fallback: full-CoT projection --------------------------------
+        # Stage 1 flagged sentences but none individually confirmed.
+        # Project the full CoT text to catch distributed leaks.
+        if self.fallback:
+            confirmed, cluster_id = self._projection_confirms(generated_cot)
+            if confirmed:
                 return LeakDetectionResult(
                     is_leaking=True,
-                    first_leak_index=0,  # can't pinpoint; truncate from start
+                    first_leak_index=0,
                     sentences=sentences,
                     stage1_flags=stage1_flags,
                     confirmed_flags=confirmed_flags,
-                    matched_claim_index=claim_idx,
-                    matched_cluster_id=self._claim_to_cluster(claim_idx),
+                    matched_cluster_id=cluster_id,
                 )
 
         # Stage 1 flags were false positives.
@@ -301,17 +284,16 @@ class CoTLeakDetector:
     # Internal
     # ------------------------------------------------------------------
 
-    def _entails_any_claim(
-        self, text: str, top_k: int | None = None
-    ) -> tuple[bool, int | None]:
-        """Delegate to the module-level :func:`entails_any_claim`."""
-        return entails_any_claim(
-            text,
-            self.claims,
-            self.bank_embeddings,
-            self.st_model,
-            self.nli,
-            cosine_prefilter=self.cosine_prefilter,
-            nli_batch_size=self.nli_batch_size,
-            top_k=top_k,
-        )
+    def _projection_confirms(self, text: str) -> tuple[bool, int | None]:
+        """Check if *text* projects near any claim cluster centroid.
+
+        Returns ``(confirmed, cluster_id)``."""
+        emb = self.st_model.encode(text, show_progress_bar=False)
+        with torch.no_grad():
+            emb_t = torch.tensor(emb, dtype=torch.float32, device=self.device)
+            proj_emb = self.projection_head(emb_t.unsqueeze(0))
+            cos_sims = (proj_emb @ self.target_centroids.T).squeeze(0)
+        max_cos = cos_sims.max().item()
+        if max_cos >= self.projection_threshold:
+            return True, int(cos_sims.argmax().item())
+        return False, None

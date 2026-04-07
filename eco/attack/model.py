@@ -1,4 +1,4 @@
-from eco.attack.soft_token import SoftTokenBank
+from eco.attack.learned_hooks import SoftTokenBank
 from eco.attack.utils import (
     apply_corruption_hook,
     apply_embeddings_extraction_hook,

@@ -20,7 +20,7 @@ import random
 import torch
 import torch.nn as nn
 
-from eco.attack.soft_token import SoftToken, SoftTokenBank
+from eco.attack.learned_hooks import SoftToken, SoftTokenBank
 from eco.attack.utils import get_nested_attr, remove_hooks
 from eco.model import HFModel
 from eco.utils import log_print, seed_everything

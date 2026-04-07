@@ -187,12 +187,17 @@ training_examples = []
 
 for triple in forget_triples:
     clean_cont = random.choice(clean_continuations)
-    training_examples.append({
+    example = {
         "prompt": triple["prompt"],
         "prefix": triple["prefix"],
         "leaking_continuation": triple["leaking_continuation"],
         "clean_continuation": clean_cont,
-    })
+    }
+    if "matched_claim_index" in triple:
+        example["matched_claim_index"] = triple["matched_claim_index"]
+    if "cluster_id" in triple:
+        example["cluster_id"] = triple["cluster_id"]
+    training_examples.append(example)
 
 # -------------------------------------------------------------------------
 # Save as JSONL

@@ -1,12 +1,12 @@
-"""Learnable soft tokens for insertion at CoT truncation points.
+"""Learnable inference-time components for CoT regeneration.
 
-A soft token is a single embedding vector (same dimensionality as the
-model's embedding layer) trained to disrupt forget-set continuations while
-preserving coherent generation.  At inference, it is inserted at the
-truncation point via a forward hook on the embedding layer.
+``SoftToken`` / ``SoftTokenBank`` — embedding vectors inserted at CoT
+truncation points via forward hooks to disrupt forget-set continuations.
 
-``SoftTokenBank`` extends this to multiple soft tokens, one per claim
-cluster, allowing claim-specific corruption.
+``ProjectionHead`` — a small MLP that maps SentenceTransformer embeddings
+into a space where distance to claim-cluster centroids discriminates
+forget-set leaks from retain-set false positives.  Used as Stage 2 of the
+leak detector, replacing the NLI entailment check.
 """
 
 import torch
@@ -107,3 +107,65 @@ class SoftTokenBank(nn.Module):
         bank = cls(n_clusters, embed_dim)
         bank.load_state_dict(torch.load(path, weights_only=True))
         return bank
+
+
+class ProjectionHead(nn.Module):
+    """MLP that projects sentence embeddings into claim-cluster centroid space.
+
+    Trained contrastively to map forget-set leak sentences near their
+    matching cluster centroid and retain sentences far from all centroids.
+    Outputs are L2-normalized so that centroid proximity is measured by
+    cosine similarity.
+
+    Parameters
+    ----------
+    input_dim : int
+        Dimensionality of the input (SentenceTransformer embedding).
+    hidden_dim : int
+        Hidden layer width.
+    output_dim : int
+        Dimensionality of the projected space.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.functional.normalize(self.net(x), dim=-1)
+
+    def save(self, path: str, target_centroids: torch.Tensor) -> None:
+        """Save projection weights and target centroids."""
+        torch.save(
+            {
+                "state_dict": self.state_dict(),
+                "target_centroids": target_centroids,
+                "input_dim": self.input_dim,
+                "hidden_dim": self.hidden_dim,
+                "output_dim": self.output_dim,
+            },
+            path,
+        )
+
+    @classmethod
+    def load(
+        cls, path: str, device: torch.device | None = None
+    ) -> tuple["ProjectionHead", torch.Tensor]:
+        """Load projection head and target centroids.
+
+        Returns ``(head, target_centroids)``."""
+        data = torch.load(path, weights_only=True, map_location=device)
+        head = cls(data["input_dim"], data["hidden_dim"], data["output_dim"])
+        head.load_state_dict(data["state_dict"])
+        target_centroids = data["target_centroids"]
+        if device is not None:
+            head = head.to(device)
+            target_centroids = target_centroids.to(device)
+        return head, target_centroids
