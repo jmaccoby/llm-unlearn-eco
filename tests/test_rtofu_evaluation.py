@@ -99,18 +99,58 @@ def _make_tokenizer():
     return tok
 
 
-def _make_rtofu(tokenizer):
-    rtofu = RTOFU(
-        formatting_tokens={
-            "prompt_prefix": "",
-            "prompt_suffix": "",
-            "answer_prefix": "",
-            "answer_suffix": "",
-        },
-        eos_token=tokenizer.eos_token,
-    )
-    rtofu.download()
-    return rtofu
+# Module-level cache: load once, reuse across all tests
+_TOKENIZER = None
+_RTOFU_BASE = None
+
+
+def _get_shared_fixtures():
+    """Return cached tokenizer and a fresh RTOFU copy (with full dataset)."""
+    global _TOKENIZER, _RTOFU_BASE
+    if _TOKENIZER is None:
+        _TOKENIZER = _make_tokenizer()
+    if _RTOFU_BASE is None:
+        _RTOFU_BASE = RTOFU(
+            formatting_tokens={
+                "prompt_prefix": "",
+                "prompt_suffix": "",
+                "answer_prefix": "",
+                "answer_suffix": "",
+            },
+            eos_token=_TOKENIZER.eos_token,
+        )
+        _RTOFU_BASE.download()
+    import copy
+    rtofu = copy.copy(_RTOFU_BASE)
+    rtofu.dataset = dict(_RTOFU_BASE.dataset)
+    return _TOKENIZER, rtofu
+
+
+# Cached evaluator instances (stateless, safe to share)
+_COSINE_SIM = None
+_ENTAILMENT = None
+_SW_COSINE_SIM = None
+
+
+def _get_cosine_similarity():
+    global _COSINE_SIM
+    if _COSINE_SIM is None:
+        _COSINE_SIM = CosineSimilarity()
+    return _COSINE_SIM
+
+
+def _get_entailment_score():
+    global _ENTAILMENT
+    if _ENTAILMENT is None:
+        _ENTAILMENT = EntailmentScore(reverse=False)
+    return _ENTAILMENT
+
+
+def _get_stepwise_cosine_similarity():
+    global _SW_COSINE_SIM
+    if _SW_COSINE_SIM is None:
+        _SW_COSINE_SIM = StepWiseCosineSimilarity()
+    return _SW_COSINE_SIM
 
 
 # ---------------------------------------------------------------------------
@@ -119,23 +159,20 @@ def _make_rtofu(tokenizer):
 
 class TestRTOFUDataset:
     def test_download_and_splits(self):
-        rtofu = RTOFU()
-        rtofu.download()
+        _, rtofu = _get_shared_fixtures()
         assert "forget10" in rtofu.dataset
         assert "retain90" in rtofu.dataset
         assert len(rtofu.dataset["forget10"]) > 0
 
     def test_load_dataset_for_eval_has_cot(self):
-        tokenizer = _make_tokenizer()
-        rtofu = _make_rtofu(tokenizer)
+        _, rtofu = _get_shared_fixtures()
         dataset = rtofu.load_dataset_for_eval("forget10", load_in_batch=True, batch_size=4)
         batch = dataset[0]
         assert "cot" in batch, "cot column must survive batchify"
         assert len(batch["cot"]) == len(batch["answer"])
 
     def test_load_dataset_for_classification(self):
-        rtofu = RTOFU()
-        rtofu.download()
+        _, rtofu = _get_shared_fixtures()
         ds = rtofu.load_dataset_for_classification("forget10")
         assert "train" in ds
         assert "forget" in ds
@@ -150,9 +187,8 @@ class TestRTOFUDataset:
 
 class TestReasoningGenerationEngine:
     def setup_method(self):
-        self.tokenizer = _make_tokenizer()
+        self.tokenizer, self.rtofu = _get_shared_fixtures()
         self.model = ReasoningModel(DummyModel(self.tokenizer))
-        self.rtofu = _make_rtofu(self.tokenizer)
         # Limit dataset to a few examples for speed
         for split in ["forget10", "retain90"]:
             self.rtofu.dataset[split] = self.rtofu.dataset[split].select(range(4))
@@ -290,8 +326,7 @@ class TestEvaluators:
         assert 0.0 <= scores[0] <= 1.0
 
     def test_cosine_similarity(self):
-        evaluator = CosineSimilarity()
-        scores = evaluator.evaluate(
+        scores = _get_cosine_similarity().evaluate(
             ["The capital of France is Paris."],
             ["Paris is the capital of France."],
         )
@@ -299,8 +334,7 @@ class TestEvaluators:
         assert 0.0 <= scores[0] <= 1.0
 
     def test_entailment_score(self):
-        evaluator = EntailmentScore(reverse=False)
-        scores = evaluator.evaluate(
+        scores = _get_entailment_score().evaluate(
             ["The capital of France is Paris."],
             ["Paris is the capital of France."],
         )
@@ -362,7 +396,7 @@ class TestStepWiseEvaluators:
         assert scores[0] == 0.0
 
     def test_stepwise_cosine_similarity_basic(self):
-        evaluator = StepWiseCosineSimilarity()
+        evaluator = _get_stepwise_cosine_similarity()
         assert evaluator.name == "stepwise_cosine_similarity"
         scores = evaluator.evaluate(
             ["The sky is blue. Grass is green."],
@@ -375,10 +409,8 @@ class TestStepWiseEvaluators:
         """Step-wise should score higher than full-sequence when steps are reordered."""
         gold = ["Paris is in France. Tokyo is in Japan. Berlin is in Germany."]
         reordered = ["Berlin is in Germany. Paris is in France. Tokyo is in Japan."]
-        stepwise = StepWiseCosineSimilarity()
-        fullseq = CosineSimilarity()
-        sw_score = stepwise.evaluate(gold, reordered)[0]
-        fs_score = fullseq.evaluate(gold, reordered)[0]
+        sw_score = _get_stepwise_cosine_similarity().evaluate(gold, reordered)[0]
+        fs_score = _get_cosine_similarity().evaluate(gold, reordered)[0]
         # Step-wise best-match compares each gold sentence to the most similar
         # generated sentence, so reordering doesn't hurt it. Full-sequence
         # cosine similarity encodes the whole string, which can vary with order.
@@ -386,14 +418,14 @@ class TestStepWiseEvaluators:
         assert sw_score >= fs_score
 
     def test_stepwise_cosine_similarity_empty(self):
-        evaluator = StepWiseCosineSimilarity()
+        evaluator = _get_stepwise_cosine_similarity()
         assert evaluator.evaluate([""], ["Some text."])[0] == 0.0
         assert evaluator.evaluate(["Some text."], [""])[0] == 0.0
 
     def test_stepwise_evaluators_multiple_examples(self):
         """Both evaluators handle multiple examples in a single call."""
         rouge_eval = StepWiseROUGERecall(mode="rougeL")
-        cosine_eval = StepWiseCosineSimilarity()
+        cosine_eval = _get_stepwise_cosine_similarity()
         gold = ["Sentence one. Sentence two.", "Another fact. More info."]
         gen = ["Sentence two. Sentence one.", "More info. Another fact."]
         rouge_scores = rouge_eval.evaluate(gold, gen)
@@ -472,8 +504,7 @@ class TestEmptyAnswerHandling:
     """Tests for per-sample AFE=0 override and think_completion_rate."""
 
     def setup_method(self):
-        self.tokenizer = _make_tokenizer()
-        self.rtofu = _make_rtofu(self.tokenizer)
+        self.tokenizer, self.rtofu = _get_shared_fixtures()
         for split in ["forget10", "retain90"]:
             self.rtofu.dataset[split] = self.rtofu.dataset[split].select(range(4))
 
@@ -529,8 +560,8 @@ class TestEmptyAnswerHandling:
             subset_names=["forget10"],
             answer_evaluator=[
                 ROUGERecall(mode="rougeL"),
-                CosineSimilarity(),
-                EntailmentScore(reverse=False),
+                _get_cosine_similarity(),
+                _get_entailment_score(),
             ],
             batch_size=4,
         )

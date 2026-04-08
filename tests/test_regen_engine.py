@@ -275,18 +275,31 @@ def _make_tokenizer():
     return tok
 
 
-def _make_rtofu(tokenizer):
-    rtofu = RTOFU(
-        formatting_tokens={
-            "prompt_prefix": "",
-            "prompt_suffix": "",
-            "answer_prefix": "",
-            "answer_suffix": "",
-        },
-        eos_token=tokenizer.eos_token,
-    )
-    rtofu.download()
-    return rtofu
+# Module-level cache: load once, reuse across all tests
+_TOKENIZER = None
+_RTOFU_BASE = None
+
+
+def _get_shared_fixtures():
+    """Return cached tokenizer and a fresh RTOFU copy (with full dataset)."""
+    global _TOKENIZER, _RTOFU_BASE
+    if _TOKENIZER is None:
+        _TOKENIZER = _make_tokenizer()
+    if _RTOFU_BASE is None:
+        _RTOFU_BASE = RTOFU(
+            formatting_tokens={
+                "prompt_prefix": "",
+                "prompt_suffix": "",
+                "answer_prefix": "",
+                "answer_suffix": "",
+            },
+            eos_token=_TOKENIZER.eos_token,
+        )
+        _RTOFU_BASE.download()
+    import copy
+    rtofu = copy.copy(_RTOFU_BASE)
+    rtofu.dataset = dict(_RTOFU_BASE.dataset)
+    return _TOKENIZER, rtofu
 
 
 # ---------------------------------------------------------------------------
@@ -297,8 +310,7 @@ class TestNoRegenWhenNoLeak:
     """When the detector returns is_leaking=False for all, output matches initial generation."""
 
     def setup_method(self):
-        self.tokenizer = _make_tokenizer()
-        self.rtofu = _make_rtofu(self.tokenizer)
+        self.tokenizer, self.rtofu = _get_shared_fixtures()
         for split in ["forget10", "retain90"]:
             self.rtofu.dataset[split] = self.rtofu.dataset[split].select(range(4))
 
@@ -329,8 +341,7 @@ class TestRegenOnLeakDetected:
     """When the detector flags the first generation, regenerated output is used."""
 
     def setup_method(self):
-        self.tokenizer = _make_tokenizer()
-        self.rtofu = _make_rtofu(self.tokenizer)
+        self.tokenizer, self.rtofu = _get_shared_fixtures()
         for split in ["forget10", "retain90"]:
             self.rtofu.dataset[split] = self.rtofu.dataset[split].select(range(1))
 
@@ -376,8 +387,7 @@ class TestMaxAttemptsRespected:
     """When the detector always flags, regeneration stops after max_attempts."""
 
     def setup_method(self):
-        self.tokenizer = _make_tokenizer()
-        self.rtofu = _make_rtofu(self.tokenizer)
+        self.tokenizer, self.rtofu = _get_shared_fixtures()
         for split in ["forget10", "retain90"]:
             self.rtofu.dataset[split] = self.rtofu.dataset[split].select(range(1))
 
@@ -418,8 +428,7 @@ class TestSoftTokenMode:
     """When regen_corrupt_mode includes soft_token, the engine passes st_position."""
 
     def setup_method(self):
-        self.tokenizer = _make_tokenizer()
-        self.rtofu = _make_rtofu(self.tokenizer)
+        self.tokenizer, self.rtofu = _get_shared_fixtures()
         for split in ["forget10", "retain90"]:
             self.rtofu.dataset[split] = self.rtofu.dataset[split].select(range(1))
 
@@ -511,8 +520,7 @@ class TestNoDetectorSkipsRegen:
     """When leak_detector is None, no regeneration happens (same as base class)."""
 
     def setup_method(self):
-        self.tokenizer = _make_tokenizer()
-        self.rtofu = _make_rtofu(self.tokenizer)
+        self.tokenizer, self.rtofu = _get_shared_fixtures()
         for split in ["forget10", "retain90"]:
             self.rtofu.dataset[split] = self.rtofu.dataset[split].select(range(4))
 

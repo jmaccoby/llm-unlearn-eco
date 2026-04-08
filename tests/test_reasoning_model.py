@@ -51,11 +51,17 @@ class FakeInnerModel(nn.Module):
         return torch.cat([input_ids, dummy], dim=1)
 
 
+_TOKENIZER = None
+
+
 def _make_tokenizer():
-    tok = AutoTokenizer.from_pretrained("gpt2")
-    if tok.pad_token_id is None:
-        tok.pad_token = tok.eos_token
-    return tok
+    global _TOKENIZER
+    if _TOKENIZER is None:
+        tok = AutoTokenizer.from_pretrained("gpt2")
+        if tok.pad_token_id is None:
+            tok.pad_token = tok.eos_token
+        _TOKENIZER = tok
+    return _TOKENIZER
 
 
 class FakeHFModel:

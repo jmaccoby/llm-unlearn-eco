@@ -1,22 +1,43 @@
 """
 Examine model responses to R-TOFU dataset queries.
 
+Supports no corruption (baseline), prompt corruption, CoT regeneration, or both.
+
 Usage:
-    python -m scripts.examine_rtofu
-    python -m scripts.examine_rtofu --split forget10 --num_examples 20
-    python -m scripts.examine_rtofu --split full --show_cot --output results/rtofu_responses.csv
+    # No corruption (baseline)
+    python -m scripts.examine_rtofu --split forget10 --num_examples 10
+
+    # Prompt corruption only
+    python -m scripts.examine_rtofu --split forget10 --num_examples 10 \
+        --corrupt_method rand_noise_first_n --dims 500 --strength 50
+
+    # Regeneration only (no prompt corruption)
+    python -m scripts.examine_rtofu --split forget10 --num_examples 4 \
+        --regen_corrupt_mode window --regen_window_mode sentences \
+        --regen_corrupt_method rand_noise_first_n --regen_dims 500 --regen_strength 50 \
+        --leak_classifier_path leak_classifiers/forget10 \
+        --projection_head_path projection_heads/forget10/projection_head.pt --show_cot
+
+    # Both prompt corruption and regeneration
+    python -m scripts.examine_rtofu --split forget10 --num_examples 4 \
+        --corrupt_method rand_noise_first_n --dims 500 --strength 50 \
+        --regen_corrupt_mode window --regen_window_mode sentences \
+        --leak_classifier_path leak_classifiers/forget10 \
+        --projection_head_path projection_heads/forget10/projection_head.pt --show_cot
 """
 import argparse
 import csv
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import GenerationConfig
 
+from eco.attack import AttackedModel, PromptClassifier
 from eco.dataset.rtofu import RTOFU
-from eco.model.reasoning import ReasoningModel
-from eco.utils import fix_bpe
+from eco.inference import ReasoningGenerationEngine
+from eco.model import HFModel, ReasoningModel
+from eco.utils import log_print
 
-MODEL_PATH = "sangyon/LRM-target"
+
+MODEL_NAME = "LRM-target"
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -28,88 +49,227 @@ parser.add_argument(
 )
 parser.add_argument("--num_examples", type=int, default=10, help="Number of examples to examine (0 = all)")
 parser.add_argument("--offset", type=int, default=0, help="Start from this index")
+parser.add_argument("--batch_size", type=int, default=4)
 parser.add_argument("--max_new_tokens", type=int, default=200)
 parser.add_argument("--show_cot", action="store_true", help="Also print the gold chain-of-thought")
 parser.add_argument("--output", type=str, default=None, help="Save results to CSV file")
+# Prompt corruption (optional)
+parser.add_argument("--corrupt_method", type=str, default=None, help="Corruption method name (e.g. rand_noise_first_n)")
+parser.add_argument("--dims", type=int, default=None, help="Number of embedding dimensions to corrupt")
+parser.add_argument("--strength", type=float, default=None, help="Corruption strength")
+parser.add_argument("--classifier_threshold", type=float, default=0.99, help="Prompt classifier confidence threshold")
+parser.add_argument("--repetition_penalty", type=float, default=None, help="Repetition penalty for generation")
+# Leak detector
+parser.add_argument("--leak_classifier_path", type=str, default=None, help="Path to trained leak classifier")
+parser.add_argument("--projection_head_path", type=str, default=None, help="Path to trained projection head for Stage 2")
+parser.add_argument("--leak_classifier_threshold", type=float, default=0.5)
+parser.add_argument("--projection_threshold", type=float, default=0.5)
+parser.add_argument("--no_fallback", action="store_true", help="Disable full-CoT fallback in leak detector")
+# Regeneration
+parser.add_argument("--regen_corrupt_mode", type=str, default=None,
+                    choices=["window", "soft_token", "window+soft_token"],
+                    help="Corruption mode for regeneration (None = disabled)")
+parser.add_argument("--regen_corrupt_method", type=str, default=None,
+                    help="Corruption method for regen (default: same as --corrupt_method)")
+parser.add_argument("--regen_dims", type=int, default=None, help="Embedding dims for regen (default: same as --dims)")
+parser.add_argument("--regen_strength", type=float, default=None, help="Noise strength for regen (default: same as --strength)")
+parser.add_argument("--regen_window", type=int, default=32)
+parser.add_argument("--regen_window_mode", type=str, default="sentences", choices=["tokens", "sentences"])
+parser.add_argument("--regen_max_attempts", type=int, default=3)
+parser.add_argument("--soft_token_path", type=str, default=None, help="Path to trained soft token embedding")
+parser.add_argument("--soft_token_bank_path", type=str, default=None, help="Path to trained soft token bank (cluster mode)")
+parser.add_argument("--n_clusters", type=int, default=0, help="Number of clusters for soft token bank (0 = infer from state dict)")
 args = parser.parse_args()
 
+# Validate
+if args.regen_corrupt_mode is not None and args.leak_classifier_path is None:
+    parser.error("--regen_corrupt_mode requires --leak_classifier_path")
+if args.leak_classifier_path is not None and args.projection_head_path is None:
+    parser.error("--leak_classifier_path requires --projection_head_path")
+if args.soft_token_path is not None and args.soft_token_bank_path is not None:
+    parser.error("--soft_token_path and --soft_token_bank_path are mutually exclusive")
+soft_token_arg = args.soft_token_path or args.soft_token_bank_path
+if soft_token_arg is not None and (
+    args.regen_corrupt_mode is None or "soft_token" not in args.regen_corrupt_mode
+):
+    parser.error("--soft_token_path/--soft_token_bank_path requires --regen_corrupt_mode to be 'soft_token' or 'window+soft_token'")
+
+# Resolve regen corruption config (fall back to prompt corruption values)
+regen_corrupt_method = args.regen_corrupt_method or args.corrupt_method
+regen_dims = args.regen_dims if args.regen_dims is not None else args.dims
+regen_strength = args.regen_strength if args.regen_strength is not None else args.strength
+if args.regen_corrupt_mode is not None and "window" in args.regen_corrupt_mode and regen_corrupt_method is None:
+    parser.error("Window regen mode requires either --regen_corrupt_method or --corrupt_method")
+if regen_corrupt_method is not None and regen_dims is None:
+    parser.error("Regen corruption requires --regen_dims or --dims")
+
 # Load model
-print(f"Loading model: {MODEL_PATH}")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-if tokenizer.pad_token_id is None:
-    tokenizer.pad_token = tokenizer.eos_token
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_PATH,
-    dtype=torch.bfloat16,
-    device_map="auto",
-)
-model.generation_config = GenerationConfig(
+log_print(f"Loading model: {MODEL_NAME}")
+generation_config = GenerationConfig(
     do_sample=False,
     max_new_tokens=args.max_new_tokens,
     use_cache=True,
-    pad_token_id=tokenizer.pad_token_id,
-    eos_token_id=tokenizer.eos_token_id,
 )
-model.eval()
-# Attach tokenizer so ReasoningModel can access it
-model.tokenizer = tokenizer
+if args.repetition_penalty is not None:
+    generation_config.repetition_penalty = args.repetition_penalty
+model = HFModel(
+    model_name=MODEL_NAME,
+    config_path="./config/rtofu_model_config",
+    generation_config=generation_config,
+)
+
+# Wrap with AttackedModel (prompt and/or regen corruption)
+needs_prompt_corruption = args.corrupt_method is not None
+needs_regen_corruption = args.regen_corrupt_mode is not None
+if needs_prompt_corruption or needs_regen_corruption:
+    prompt_classifier = None
+    corrupt_args = None
+    if needs_prompt_corruption:
+        log_print(f"Loading prompt classifier: rtofu_classifiers/{args.split}")
+        prompt_classifier = PromptClassifier(
+            model_name="roberta-base",
+            model_path=f"rtofu_classifiers/{args.split}",
+            batch_size=args.batch_size,
+        )
+        corrupt_args = {"dims": args.dims}
+        if args.strength is not None:
+            corrupt_args["strength"] = args.strength
+
+    regen_corrupt_args = None
+    if needs_regen_corruption:
+        regen_corrupt_args = {"dims": regen_dims}
+        if regen_strength is not None:
+            regen_corrupt_args["strength"] = regen_strength
+
+    soft_token = None
+    if args.soft_token_bank_path is not None:
+        import torch
+        from eco.attack.learned_hooks import SoftTokenBank
+        embed_dim = model.model_config["embedding_dim"]
+        if args.n_clusters > 0:
+            n_clusters = args.n_clusters
+        else:
+            sd = torch.load(args.soft_token_bank_path, weights_only=True)
+            n_clusters = sum(1 for k in sd if k.endswith(".embedding"))
+        soft_token = SoftTokenBank.load(args.soft_token_bank_path, n_clusters=n_clusters, embed_dim=embed_dim)
+        log_print(f"Loaded soft token bank ({n_clusters} clusters) from {args.soft_token_bank_path}")
+    elif args.soft_token_path is not None:
+        from eco.attack.learned_hooks import SoftToken
+        soft_token = SoftToken.load(args.soft_token_path, embed_dim=model.model_config["embedding_dim"])
+        log_print(f"Loaded soft token from {args.soft_token_path}")
+
+    model = AttackedModel(
+        model=model,
+        prompt_classifier=prompt_classifier,
+        token_classifier=None,
+        corrupt_method=args.corrupt_method,
+        corrupt_args=corrupt_args,
+        classifier_threshold=args.classifier_threshold,
+        regen_corrupt_method=regen_corrupt_method,
+        regen_corrupt_args=regen_corrupt_args,
+        soft_token=soft_token,
+    )
+
 model = ReasoningModel(model)
 
-# Load dataset
-print(f"Loading R-TOFU split: {args.split}")
-data_module = RTOFU()
+# Load dataset and select examples
+log_print(f"Loading R-TOFU split: {args.split}")
+data_module = RTOFU(
+    formatting_tokens=model.model_config.get("formatting_tokens"),
+    eos_token=model.tokenizer.eos_token,
+)
 data_module.download()
-dataset = data_module.dataset[args.split]
 
-end = len(dataset) if args.num_examples == 0 else min(args.offset + args.num_examples, len(dataset))
-examples = dataset.select(range(args.offset, end))
+end = len(data_module.dataset[args.split]) if args.num_examples == 0 else min(
+    args.offset + args.num_examples, len(data_module.dataset[args.split])
+)
+data_module.dataset[args.split] = data_module.dataset[args.split].select(range(args.offset, end))
 
-print(f"\nExamining {len(examples)} examples from split '{args.split}'\n")
-print("=" * 80)
+# Generate via engine
+if args.regen_corrupt_mode is not None:
+    from eco.attack.leak_detector import CoTLeakDetector
+    from eco.inference_regen import RegeneratingReasoningEngine
 
+    leak_detector = CoTLeakDetector(
+        classifier_path=args.leak_classifier_path,
+        projection_head_path=args.projection_head_path,
+        classifier_threshold=args.leak_classifier_threshold,
+        projection_threshold=args.projection_threshold,
+        fallback=not args.no_fallback,
+    )
+    engine = RegeneratingReasoningEngine(
+        model=model,
+        tokenizer=model.tokenizer,
+        data_module=data_module,
+        subset_names=[args.split],
+        answer_evaluator=[],
+        batch_size=args.batch_size,
+        leak_detector=leak_detector,
+        regen_corrupt_mode=args.regen_corrupt_mode,
+        regen_window=args.regen_window,
+        regen_window_mode=args.regen_window_mode,
+        regen_max_attempts=args.regen_max_attempts,
+    )
+    log_print(f"Regeneration enabled: mode={args.regen_corrupt_mode}, max_attempts={args.regen_max_attempts}")
+else:
+    engine = ReasoningGenerationEngine(
+        model=model,
+        tokenizer=model.tokenizer,
+        data_module=data_module,
+        subset_names=[args.split],
+        answer_evaluator=[],
+        batch_size=args.batch_size,
+    )
+
+corruption_desc = args.corrupt_method or "none"
+log_print(f"\nExamining {end - args.offset} examples from split '{args.split}'")
+log_print(f"Prompt corruption: {corruption_desc} (dims={args.dims}, strength={args.strength})")
+if args.regen_corrupt_mode:
+    log_print(f"Regen corruption: {regen_corrupt_method} (dims={regen_dims}, strength={regen_strength})")
+log_print("=" * 80)
+
+generations = engine._generate()
+data = generations[args.split]
+
+# Flatten batch lists
+prompts = [item for batch in data["prompt"] for item in batch]
+gold_answers = [item for batch in data["gold_answer"] for item in batch]
+gold_cots = [item for batch in data["gold_cot"] for item in batch]
+generated_cots = [item for batch in data["generated_cot"] for item in batch]
+generated_answers = [item for batch in data["generated_answer"] for item in batch]
+
+# Display results
 results = []
-
-for i, example in enumerate(examples):
-    question = example["question"]
-    gold_answer = example["answer"]
-    cot = example.get("cot", "")
-
-    # Generate response (ReasoningModel appends <think>\n automatically)
-    inputs = tokenizer(question, return_tensors="pt").to(device)
-    decode_start = inputs["input_ids"].shape[1] + model.n_think_tokens
-    with torch.no_grad():
-        output_ids = model.generate(**inputs, generation_config=model.generation_config)
-    # Slice to new tokens only (after question + think prefix),
-    # then apply inverse BPE byte mapping to resolve Ġ/Ċ characters
-    raw = tokenizer.decode(output_ids[0][decode_start:], skip_special_tokens=True)
-    raw = fix_bpe(raw)
-    # Extract final answer after the reasoning block
-    think_block, response = raw.split("</think>\n\n", 1) if "</think>\n\n" in raw else (raw, "")
-
-    # Print
+for i in range(len(prompts)):
     idx = args.offset + i
-    print(f"[{idx}] QUESTION:\n{question}\n")
-    print(f"GOLD ANSWER:\n{gold_answer}\n")
+    log_print(f"\n[{idx}] QUESTION:\n{prompts[i]}\n")
+    log_print(f"GOLD ANSWER:\n{gold_answers[i]}\n")
     if args.show_cot:
-        if think_block:
-            print(f"MODEL THINKING:\n{think_block.strip()}\n")
-        if cot:
-            print(f"GOLD COT:\n{cot}\n")
-    print(f"MODEL RESPONSE:\n{response}\n")
-    print("-" * 80)
+        if gold_cots[i]:
+            log_print(f"GOLD COT:\n{gold_cots[i]}\n")
+        if generated_cots[i]:
+            log_print(f"MODEL THINKING:\n{generated_cots[i].strip()}\n")
+    log_print(f"MODEL RESPONSE:\n{generated_answers[i]}\n")
+    log_print("-" * 80)
 
-    results.append({"index": idx, "question": question, "gold_answer": gold_answer, "response": response})
+    row = {"index": idx, "question": prompts[i], "gold_answer": gold_answers[i], "response": generated_answers[i]}
+    if args.show_cot:
+        row["gold_cot"] = gold_cots[i]
+        row["model_cot"] = generated_cots[i]
+    results.append(row)
 
 # Save to CSV if requested
 if args.output:
+    fieldnames = ["index", "question", "gold_answer", "response"]
+    if args.show_cot:
+        fieldnames.extend(["gold_cot", "model_cot"])
     with open(args.output, "w", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["index", "question", "gold_answer", "response"],
+            fieldnames=fieldnames,
             quoting=csv.QUOTE_NONNUMERIC,
             escapechar="\\",
         )
         writer.writeheader()
         writer.writerows(results)
-    print(f"Saved {len(results)} results to {args.output}")
+    log_print(f"Saved {len(results)} results to {args.output}")
